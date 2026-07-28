@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, Spinner, Tag, Text, TextField } from '@capra/core';
-import { ClockOutlined, ReloadOutlined, SwapRightOutlined } from '@capra/icons';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Alert, Button, Checkbox, Modal, Spinner, Tag, Text } from '@capra/core';
+import { ReloadOutlined, SwapRightOutlined } from '@capra/icons';
 import {
   commitFiles,
   deployGroup,
@@ -8,20 +8,15 @@ import {
   hasDottedStem,
   listGroups,
   listLookups,
-  loadBrowserSchedule,
   loadSelection,
   lookupExists,
   pendingLookupFiles,
-  runHeadlessSync,
-  saveBrowserSchedule,
   saveSelection,
   upsertLookup,
-  type BrowserSchedule,
   type Group,
   type Lookup,
   type SyncState,
 } from './api';
-import { lastDue, nextDue } from './cron';
 
 const DEFAULT_SOURCE = 'default_search';
 
@@ -67,14 +62,6 @@ function App() {
   const [needsDeploy, setNeedsDeploy] = useState<Set<string>>(new Set());
   const [log, setLog] = useState<LogLine[]>([]);
 
-  // Scheduled sync — credential-less, runs in-app on the signed-in session.
-  const [cron, setCron] = useState('0 7 * * *');
-  const [deployAfter, setDeployAfter] = useState(true);
-  const [schedule, setSchedule] = useState<BrowserSchedule | null>(null);
-  const [scheduleRunning, setScheduleRunning] = useState(false);
-  const [confirmScheduleOpen, setConfirmScheduleOpen] = useState(false);
-  const scheduleRunningRef = useRef(false);
-
   const appendLog = useCallback((kind: LogLine['kind'], text: string) => {
     setLog((prev) => [...prev, { kind, text }]);
   }, []);
@@ -89,14 +76,12 @@ function App() {
     let cancelled = false;
     (async () => {
       try {
-        const [allGroups, saved, sched] = await Promise.all([
+        const [allGroups, saved] = await Promise.all([
           listGroups(),
           loadSelection().catch(() => null),
-          loadBrowserSchedule().catch(() => null),
         ]);
         if (cancelled) return;
         setGroups(allGroups);
-        if (sched) setSchedule(sched);
         if (saved) {
           if (allGroups.some((g) => g.id === saved.sourceGroup)) setSourceGroup(saved.sourceGroup);
           setSelectedLookups(new Set(saved.lookups));
@@ -131,46 +116,6 @@ function App() {
       cancelled = true;
     };
   }, [sourceGroup]);
-
-  // Schedule loop: while armed and the app is open, run when a cron
-  // occurrence is due. lastRun is claimed in the KV store BEFORE running so
-  // another open tab won't double-run; missed windows (app closed) surface
-  // as a due occurrence the moment the app reopens. Syncs are idempotent, so
-  // an occasional race costs nothing but a no-op.
-  useEffect(() => {
-    if (!schedule?.enabled) return;
-    const tick = async () => {
-      if (scheduleRunningRef.current) return;
-      const due = lastDue(schedule.cron, Date.now());
-      if (due === null || (schedule.lastRun !== null && due <= schedule.lastRun)) return;
-      scheduleRunningRef.current = true;
-      setScheduleRunning(true);
-      try {
-        const claimed = { ...schedule, lastRun: due };
-        await saveBrowserSchedule(claimed);
-        setSchedule(claimed);
-        appendLog('info', `scheduled sync due ${new Date(due).toLocaleString()} — running with your session`);
-        const res = await runHeadlessSync({
-          sourceGroup: schedule.sourceGroup,
-          lookups: schedule.lookups,
-          targetGroups: schedule.targetGroups,
-          deploy: schedule.deploy,
-        });
-        for (const l of res.lines) appendLog(l.kind, l.text);
-        const undeployed = res.committedGroups.filter((g) => !res.deployedGroups.includes(g));
-        if (undeployed.length > 0) setNeedsDeploy((prev) => new Set([...prev, ...undeployed]));
-        if (res.committedGroups.length === 0) appendLog('info', 'scheduled sync: everything already in sync');
-      } catch (e) {
-        appendLog('error', `scheduled sync failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        scheduleRunningRef.current = false;
-        setScheduleRunning(false);
-      }
-    };
-    void tick();
-    const handle = setInterval(() => void tick(), 30_000);
-    return () => clearInterval(handle);
-  }, [schedule, appendLog]);
 
   const toggle = (set: Set<string>, id: string, apply: (next: Set<string>) => void) => {
     const next = new Set(set);
@@ -323,40 +268,6 @@ function App() {
       appendLog('error', `[${gid}] deploy failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setDeploying(null);
-    }
-  };
-
-  const cronValid = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(cron.trim());
-
-  const armSchedule = async () => {
-    setConfirmScheduleOpen(false);
-    const sched: BrowserSchedule = {
-      enabled: true,
-      cron: cron.trim(),
-      deploy: deployAfter,
-      sourceGroup,
-      lookups: [...selectedLookups],
-      targetGroups: [...selectedGroups],
-      lastRun: Date.now(), // start with the NEXT occurrence; use Sync for an immediate run
-    };
-    try {
-      await saveBrowserSchedule(sched);
-      setSchedule(sched);
-      appendLog('success', `scheduled sync enabled: ${sched.cron} — ${sched.lookups.join(', ')} → ${sched.targetGroups.join(', ')}`);
-    } catch (e) {
-      appendLog('error', `failed to save schedule: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-
-  const disarmSchedule = async () => {
-    if (!schedule) return;
-    const sched = { ...schedule, enabled: false };
-    try {
-      await saveBrowserSchedule(sched);
-      setSchedule(sched);
-      appendLog('info', 'scheduled sync disabled');
-    } catch (e) {
-      appendLog('error', `failed to disable schedule: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -534,66 +445,6 @@ function App() {
         </section>
       )}
 
-      <section className="panel">
-        <div className="panel-header">
-          <span className="pick-label">
-            <ClockOutlined />
-            <Text variant="body-md-semibold">Scheduled sync</Text>
-            <Tag size="sm" color="criblTeal">no credentials — uses your session</Tag>
-            {scheduleRunning && <Spinner size="sm" />}
-          </span>
-          {schedule?.enabled ? (
-            <Button size="sm" variant="secondary" onClick={() => void disarmSchedule()}>
-              Disable
-            </Button>
-          ) : (
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={selectedLookups.size === 0 || selectedGroups.size === 0 || !cronValid}
-              onClick={() => setConfirmScheduleOpen(true)}
-            >
-              Enable
-            </Button>
-          )}
-        </div>
-        {schedule?.enabled ? (
-          <Text color="secondary">
-            Runs <Text variant="code">{schedule.cron}</Text> while this app is open:{' '}
-            {schedule.lookups.join(', ')} from {schedule.sourceGroup} into{' '}
-            {schedule.targetGroups.join(', ')}
-            {schedule.deploy ? ', then deploys' : ' (commit only)'}. Last run:{' '}
-            {schedule.lastRun ? new Date(schedule.lastRun).toLocaleString() : 'never'}; next:{' '}
-            {(() => {
-              const n = nextDue(schedule.cron, Date.now());
-              return n ? new Date(n).toLocaleString() : 'unknown';
-            })()}. Missed windows run as soon as the app is reopened.
-          </Text>
-        ) : (
-          <>
-            <Text color="secondary">
-              The sync runs inside this app with your signed-in session — no credentials, no
-              collectors, nothing on workers. It runs while someone has the app open; missed
-              windows are caught up on open, and unchanged lookups are no-ops. Enable uses the
-              current lookup and group selection above.
-            </Text>
-            <div className="schedule-form">
-              <TextField
-                label="Cron schedule"
-                value={cron}
-                onChange={setCron}
-                appearance={cronValid ? 'default' : 'danger'}
-                placeholder="0 7 * * *"
-                helperText="When the sync runs (your local time, while the app is open)"
-              />
-              <Checkbox checked={deployAfter} onChange={() => setDeployAfter((v) => !v)}>
-                Deploy after sync
-              </Checkbox>
-            </div>
-          </>
-        )}
-      </section>
-
       {needsDeploy.size > 0 && (
         <section className="panel">
           <div className="panel-header">
@@ -661,35 +512,6 @@ function App() {
               </ul>
             </div>
           ))}
-        </div>
-      </Modal>
-
-      <Modal
-        isOpen={confirmScheduleOpen}
-        title="Enable scheduled sync?"
-        confirmButtonText="Enable"
-        cancelButtonText="Cancel"
-        onConfirm={() => void armSchedule()}
-        onClose={() => setConfirmScheduleOpen(false)}
-      >
-        <div className="confirm-body">
-          <Text as="p">
-            While this app is open, it will automatically sync, commit
-            {deployAfter ? ', and deploy' : ''} on the schedule below using your signed-in
-            session — no further confirmation per run. Runs are logged in the Activity panel,
-            commits stay scoped to the touched lookup files, and unchanged lookups are no-ops.
-          </Text>
-          <ul className="confirm-spec">
-            <li><Text color="secondary">Lookups:</Text> <Text variant="code">{[...selectedLookups].join(', ')}</Text></li>
-            <li><Text color="secondary">Source group:</Text> <Text variant="code">{sourceGroup}</Text></li>
-            <li><Text color="secondary">Targets:</Text> <Text variant="code">{[...selectedGroups].join(', ')}</Text></li>
-            <li><Text color="secondary">Schedule:</Text> <Text variant="code">{cron.trim()}</Text> (while app is open; catch-up on reopen)</li>
-            <li><Text color="secondary">After sync:</Text> {deployAfter ? 'deploy immediately' : 'commit only — deploy manually'}</li>
-          </ul>
-          <Text as="p" color="secondary">
-            Nothing runs while the app is closed. The schedule is stored in the app's KV store
-            and shared across tabs; the first run happens at the next cron occurrence.
-          </Text>
         </div>
       </Modal>
 

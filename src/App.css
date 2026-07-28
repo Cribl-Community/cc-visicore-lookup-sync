@@ -135,13 +135,6 @@
   color: token('color.foreground.success.default');
 }
 
-.schedule-form {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: token('spacing.lg');
-}
-
 .confirm-spec {
   list-style: none;
   display: flex;
