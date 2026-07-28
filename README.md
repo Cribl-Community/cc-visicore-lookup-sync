@@ -78,9 +78,14 @@ explicit confirmation, and every run is logged in an activity panel.
 
 ### Scheduled sync prerequisite (per worker node)
 
-The scheduled collector runs `sync_search_lookup.py` on a worker node of the
-target group, and that script authenticates on its own. One-time setup on each
-worker node, as the user Cribl runs as:
+The app's platform-injected auth covers only the API calls the app itself
+makes while open in your browser. A **scheduled** sync runs with no browser
+and no app involved: the app merely writes the collector definition into
+group config, and when the schedule fires, a worker node executes
+`sync_search_lookup.py` as a plain OS process that calls the leader's REST
+API directly — outside the app sandbox, where nothing injects auth. The
+script therefore needs its own credentials. One-time setup on each worker
+node of the target group, as the user Cribl runs as:
 
 ```bash
 cat > ~/.cribl-lookup-sync.env <<'EOF'
