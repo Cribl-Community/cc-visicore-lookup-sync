@@ -7,11 +7,9 @@ scoped to only the files touched, and on-demand deploys.
 session via the platform's injected auth.
 
 This is the Cribl App port of
-[VisiCore/vct-cribl-lookup-sync](https://github.com/VisiCore/vct-cribl-lookup-sync),
-which does the same job as a standalone Python script driven by cron or a
-Script collector. The app keeps the script's careful semantics and drops all
-of its operational baggage: no API credentials, no env files on worker
-nodes, no Python — the sync engine is TypeScript inside the app.
+[VisiCore/vct-cribl-lookup-sync](https://github.com/VisiCore/vct-cribl-lookup-sync)
+— same job, very different operational footprint. See
+[App vs. script](#app-vs-script) for when to use which.
 
 ![Lookup Sync app: source/target selection with pack tags and filter, compare actions, and the per-group status matrix](images/lookup-sync-app.png)
 
@@ -57,13 +55,36 @@ implicitly.
 Selections persist in the app's KV store, all destructive operations require
 explicit confirmation, and every run is logged in an activity panel.
 
-**Scheduling is deliberately out of scope.** This app is for ad hoc syncs on
-your own session. Cribl apps have no server side, so anything scheduled
-would either only run while the app is open, or require stored API
-credentials on a worker — if you need fully unattended syncs, use the
-original
-[script + scheduled collector](https://github.com/VisiCore/vct-cribl-lookup-sync)
-approach instead; the two coexist fine.
+## App vs. script
+
+This app is a faithful port of the original script — same compare-first,
+scoped-commit, deploy-last semantics, same API calls underneath. What
+changed is the operational footprint:
+
+**Where the app wins: setup is zero.** Open it and sync. The platform
+injects your signed-in session's auth into every call, so there are no API
+credentials to create, no env file to drop on a host, no cron or collector
+to wire up, and nothing to rotate or leak later. Admins review a declared
+API surface (`config/policies.yml`) at install time instead of trusting a
+bearer token sitting on a box.
+
+**Where the script wins: unattended scheduling.** A Cribl app runs in your
+browser — it has no server side for a timer to live on, and session auth
+can't outlive the session. So this app cannot sync while nobody has it
+open. The script, driven by cron or a scheduled Script collector with its
+own API credentials, happily syncs at 3 a.m. with no one watching. That
+capability is exactly what its extra setup pays for.
+
+| | This app | Original script |
+|---|---|---|
+| Setup | None — open and sync | API credentials + env file + cron / Script collector |
+| Auth | Signed-in session, nothing stored | Stored API credentials |
+| Runs | On demand, while the app is open | Unattended, on a schedule |
+| Best for | Ad hoc syncs, status checks, controlled deploys | Hands-off recurring syncs |
+
+The two coexist fine — many setups want both: the script keeps nightly
+syncs flowing, and this app is where you check status, sync on demand, and
+deploy deliberately.
 
 ## Requirements & installation
 
