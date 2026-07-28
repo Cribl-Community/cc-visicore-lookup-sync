@@ -86,11 +86,42 @@ The two coexist fine — many setups want both: the script keeps nightly
 syncs flowing, and this app is where you check status, sync on demand, and
 deploy deliberately.
 
-## Requirements & installation
+## Installation
 
-- Cribl 4.18.0+ (leader with the App platform enabled).
-- Install the packaged app archive (`npm run package` → `build/*.tgz`) via
-  your leader's Apps management page.
+**Requires Cribl 4.18.0+** (a leader with the App platform enabled). Install
+one of three ways:
+
+### Option 1: Import from Git (recommended)
+
+Every release tag carries the built app, so the leader can install straight
+from this repository — no download, no build:
+
+1. On your leader, open the Apps management page and choose **Import from
+   Git**.
+2. Repository URL: `https://github.com/Cribl-Community/cc-visicore-lookup-sync.git`
+3. Ref: `latest` (rolling tag that always points at the newest release), or
+   pin a specific version tag like `v1.0.0`.
+
+Note: only release tags contain the built app layout (`static/`, `default/`)
+— importing the `main` branch won't work.
+
+### Option 2: Upload a release archive
+
+Download the `.tgz` from the
+[latest GitHub release](https://github.com/Cribl-Community/cc-visicore-lookup-sync/releases/latest)
+and upload it on your leader's Apps management page.
+
+### Option 3: Build from source
+
+```bash
+npm ci
+npm run package   # → build/*.tgz
+```
+
+Then upload the archive from `build/` as in Option 2.
+
+### What admins see, and what the app can touch
+
 - At install time, admins see the app's full API surface in
   [`config/policies.yml`](config/policies.yml): lookups read/write, scoped
   version commits, and group listing/deploys. No external domains are used
