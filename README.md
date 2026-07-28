@@ -11,6 +11,8 @@ which does the same job as a standalone Python script driven by cron or a
 Script collector. The app keeps the script's careful semantics and adds a UI,
 platform-managed auth, and admin-reviewable API access.
 
+![Lookup Sync app: source/target selection, status matrix, scheduled sync editor, and scheduled syncs overview](images/lookup-sync-app.png)
+
 ## Why
 
 You have data in Cribl Lake — asset inventory, threat intel, user/host
