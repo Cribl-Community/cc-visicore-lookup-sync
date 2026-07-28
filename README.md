@@ -1,15 +1,17 @@
 # Lookup Sync — a Cribl App
 
 Sync lookup files from Cribl Search knowledge into Stream worker groups and
-Edge fleets, right from the Cribl UI — with byte-for-byte comparison, commits
-scoped to only the files touched, on-demand deploys, and managed scheduled
-syncs.
+Edge fleets, right from the Cribl UI — byte-for-byte comparison, commits
+scoped to only the files touched, on-demand deploys, and in-app scheduled
+syncs. **Completely credential-less**: every call runs on the signed-in
+user's session via the platform's injected auth.
 
 This is the Cribl App port of
 [VisiCore/vct-cribl-lookup-sync](https://github.com/VisiCore/vct-cribl-lookup-sync),
 which does the same job as a standalone Python script driven by cron or a
-Script collector. The app keeps the script's careful semantics and adds a UI,
-platform-managed auth, and admin-reviewable API access.
+Script collector. The app keeps the script's careful semantics and drops all
+of its operational baggage: no API credentials, no env files on worker
+nodes, no Python — the sync engine is TypeScript inside the app.
 
 ![Lookup Sync app: source/target selection, status matrix, scheduled sync editor, and scheduled syncs overview](images/lookup-sync-app.png)
 
@@ -50,37 +52,24 @@ deploy too.
 **Deploy** — per-group button with its own confirmation. Nothing deploys
 implicitly.
 
-**Scheduled sync** — two modes, matching how much unattendedness you need:
+**Scheduled sync** — entirely credential-less: the sync runs inside the app
+on the signed-in user's session, at a cron evaluated while the app is open.
+No API credentials, no secrets, no collectors, nothing installed on worker
+nodes. Missed windows are caught up the moment the app reopens, runs are
+idempotent (byte-compared, no-op when unchanged), the schedule lives in the
+app's KV store and is shared across tabs (with a `lastRun` claim so two open
+tabs don't double-run), and every run is logged in the Activity panel.
 
-| | In-app schedule | Worker collector |
-|---|---|---|
-| Credentials | **None** — your signed-in session | API credentials, stored encrypted in the group's secrets store |
-| Runs | While anyone has the app open; missed windows catch up on open | Fully unattended, on the leader's scheduler |
-| Worker-node setup | None | None (script embedded in config; only needs `python3`) |
-| Deploy after sync | Immediate | Detached, delayed (worker-restart safe) |
-
-The **in-app schedule** runs the sync inside the app itself on the platform's
-injected auth — no secrets anywhere. Since syncs are idempotent
-(byte-compared, no-op when unchanged), the "runs while open" semantic is
-useful for teams that keep dashboards open, and harmless when it overlaps.
-
-The **worker collector** provisions a scheduled Script collector
-(`sync-search-lookups`) into the target group with **zero worker-node
-setup**: the sync script is embedded in the collector config itself, and API
-credentials are stored in the group's encrypted secrets store and resolved on
-the worker at run time. The app creates/updates the collector and secret via
-the API and commits scoped to `local/cribl/jobs.yml` +
-`local/cribl/secrets.yml`. The schedule (and the credentials) reach the
-workers on the next deploy of the group.
-
-**Scheduled syncs overview** — the app scans every group for the sync
-collector and lists what each one syncs (lookups, source, cron, enabled,
-deploy behavior), parsed from the actual committed definition — including
-collectors created outside the app. Schedules can be removed from here, with
-confirmation and a scoped commit.
+The honest trade-off: **nothing runs while nobody has the app open.** That
+is a platform property, not an app choice — Cribl apps have no server side,
+and a session credential cannot outlive the session. If you need fully
+unattended syncs with the app closed, use the original
+[script + scheduled collector](https://github.com/VisiCore/vct-cribl-lookup-sync)
+approach, which necessarily involves stored API credentials.
 
 Selections persist in the app's KV store, all destructive operations require
-explicit confirmation, and every run is logged in an activity panel.
+explicit confirmation (enabling the schedule confirms once, up front, exactly
+what will run automatically), and every run is logged in an activity panel.
 
 ## Requirements & installation
 
@@ -89,63 +78,22 @@ explicit confirmation, and every run is logged in an activity panel.
   your leader's Apps management page.
 - At install time, admins see the app's full API surface in
   [`config/policies.yml`](config/policies.yml): lookups read/write, scoped
-  version commits, group listing/deploys, `lib/jobs` for the scheduled
-  collector, and `system/secrets` for its credentials. No external domains
-  are used (`config/proxies.yml` is empty).
-- No credentials are configured in the app — the platform injects the signed-in
-  user's auth into every API call.
+  version commits, and group listing/deploys. No external domains are used
+  (`config/proxies.yml` is empty).
+- **Zero credentials, anywhere.** The platform injects the signed-in user's
+  auth into every API call the app makes — including scheduled runs, which
+  execute inside the app. There is nothing to create, store, rotate, or leak:
+  no API credentials, no secrets store entries, no files on worker nodes.
+  The user who enables a schedule needs rights to read Search knowledge and
+  edit/commit/deploy the target groups — the same rights the interactive
+  buttons already require.
 
-### How scheduled syncs authenticate (no SSH, no worker-node files)
-
-The app's platform-injected auth covers only the API calls the app itself
-makes while open in your browser — that is what the credential-less
-**in-app schedule** uses, and why it stops when the app closes. (This mirrors
-how other Cribl App Platform apps handle background behavior: apps have no
-server side, so e.g. cc-visicore-vitals provisions native Cribl Notifications
-for its alerting rather than running anything itself. No native Cribl
-primitive exists for cross-group lookup sync, so true unattended syncs need
-the collector below.)
-
-A **worker collector** sync runs with no browser involved: when the schedule
-fires, a worker node executes the sync script as a plain OS process that
-calls the leader's REST API directly — outside the app sandbox, where
-nothing injects auth.
-
-This app deviates from the original repo (which required SSHing into each
-worker node to drop a credentials env file and fetched the script from
-GitHub at run time) so that nothing ever has to touch a worker node — which
-also makes it work for **Cribl.Cloud-managed workers**, where SSH isn't
-possible at all:
-
-- **Script delivery**: `sync_search_lookup.py` is embedded in the app bundle
-  and inlined into the collector's discover script as a quoted heredoc. The
-  worker writes it to a temp file and runs it. No GitHub dependency,
-  air-gap friendly.
-- **Credentials**: entered once in the app's schedule editor and stored as a
-  `credentials`-type secret (`cc-lookup-sync-creds`) in the target group's
-  encrypted secrets store — the same KMS-backed mechanism every Cribl source
-  uses for API keys. The collector's environment variables are JavaScript
-  expressions evaluated on the worker at task launch:
-
-  ```yaml
-  envVars:
-    - name: CRIBL_CLIENT_ID
-      value: C.Secret('cc-lookup-sync-creds', 'credentials').username
-    - name: CRIBL_CLIENT_SECRET
-      value: C.Secret('cc-lookup-sync-creds', 'credentials').password
-  ```
-
-  Plaintext never appears in config or git — `secrets.yml` is committed
-  encrypted, and workers decrypt at run time.
-- **Distribution**: secrets ship with group config, so credentials (like the
-  schedule itself) take effect on the next deploy. Until a group has been
-  deployed with the secret, `C.Secret` cannot resolve on its workers.
-
-The credentials need rights to read Search knowledge and to edit, commit,
-and deploy the target group. Only remaining requirement on worker nodes:
-`python3` (present on standard Cribl workers). The scheduled run uses
-`--deploy-delay` (not `--deploy`) so the deploy-triggered worker restart
-can't kill the collector task that launched it.
+This design mirrors how other Cribl App Platform apps handle background
+behavior (apps have no server side — e.g. cc-visicore-vitals provisions
+native Cribl Notifications for alerting rather than running anything
+itself). No native Cribl primitive exists for cross-group lookup sync, so
+this app runs it in-session; syncs that must run with the app closed are the
+original script's territory.
 
 ## Known limitation: dotted lookup names
 
@@ -169,8 +117,10 @@ npm run package   # build + installable archive in build/ (bumps version)
 
 Built with React 19, TypeScript, Vite, and Cribl's
 [Capra design system](https://capra.cribl.io). `src/api.ts` is the entire
-Cribl REST surface; `src/App.tsx` is the UI. See `AGENTS.md` for the Cribl
-App platform developer guide (fetch proxy, KV store, policies).
+Cribl REST surface plus the headless sync engine; `src/cron.ts` is a minimal
+5-field cron matcher for the in-app schedule; `src/App.tsx` is the UI. See
+`AGENTS.md` for the Cribl App platform developer guide (fetch proxy, KV
+store, policies).
 
 Implementation notes carried over from the original script:
 

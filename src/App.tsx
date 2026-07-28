@@ -1,38 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, NumberField, PasswordField, Spinner, Tag, Text, TextField } from '@capra/core';
+import { Alert, Button, Checkbox, Modal, Spinner, Tag, Text, TextField } from '@capra/core';
 import { ClockOutlined, ReloadOutlined, SwapRightOutlined } from '@capra/icons';
 import {
-  buildSyncCollector,
   commitFiles,
-  deleteSyncCollector,
-  deleteSyncSecret,
   deployGroup,
   getRawContent,
-  getSyncCollector,
-  getSyncSecret,
   hasDottedStem,
-  loadBrowserSchedule,
-  parseSyncCollector,
-  pendingScheduleFiles,
-  runHeadlessSync,
-  saveBrowserSchedule,
   listGroups,
   listLookups,
+  loadBrowserSchedule,
   loadSelection,
   lookupExists,
   pendingLookupFiles,
+  runHeadlessSync,
+  saveBrowserSchedule,
   saveSelection,
-  SYNC_COLLECTOR_ID,
-  SYNC_SECRET_ID,
   upsertLookup,
-  upsertSyncCollector,
-  upsertSyncSecret,
   type BrowserSchedule,
-  type CollectorJob,
   type Group,
   type Lookup,
-  type SyncAuthMode,
-  type SyncSecretInfo,
   type SyncState,
 } from './api';
 import { lastDue, nextDue } from './cron';
@@ -81,25 +67,13 @@ function App() {
   const [needsDeploy, setNeedsDeploy] = useState<Set<string>>(new Set());
   const [log, setLog] = useState<LogLine[]>([]);
 
-  // Scheduled sync (Script collector) state
-  const [schedules, setSchedules] = useState<Record<string, CollectorJob | null>>({});
-  const [groupSecrets, setGroupSecrets] = useState<Record<string, SyncSecretInfo | null>>({});
+  // Scheduled sync — credential-less, runs in-app on the signed-in session.
   const [cron, setCron] = useState('0 7 * * *');
-  const [deployDelay, setDeployDelay] = useState(30);
   const [deployAfter, setDeployAfter] = useState(true);
-  const [schedEnabled, setSchedEnabled] = useState(true);
-  const [authMode, setAuthMode] = useState<SyncAuthMode>('cloud');
-  const [baseUrl, setBaseUrl] = useState(() => (window.CRIBL_API_URL ?? '').replace(/\/api\/v1\/?$/, ''));
-  const [credId, setCredId] = useState('');
-  const [credSecret, setCredSecret] = useState('');
-  const [confirmSchedule, setConfirmSchedule] = useState<{ gid: string; action: 'save' | 'remove' } | null>(null);
-  const [schedBusy, setSchedBusy] = useState<string | null>(null);
-
-  // In-app (browser) schedule — credential-less, runs while the app is open.
-  const [browserSched, setBrowserSched] = useState<BrowserSchedule | null>(null);
-  const [browserRunning, setBrowserRunning] = useState(false);
-  const [confirmBrowserSchedule, setConfirmBrowserSchedule] = useState(false);
-  const browserRunningRef = useRef(false);
+  const [schedule, setSchedule] = useState<BrowserSchedule | null>(null);
+  const [scheduleRunning, setScheduleRunning] = useState(false);
+  const [confirmScheduleOpen, setConfirmScheduleOpen] = useState(false);
+  const scheduleRunningRef = useRef(false);
 
   const appendLog = useCallback((kind: LogLine['kind'], text: string) => {
     setLog((prev) => [...prev, { kind, text }]);
@@ -110,19 +84,19 @@ function App() {
     [groups, sourceGroup],
   );
 
-  // Initial load: groups, saved selection, then the source group's lookups.
+  // Initial load: groups, saved selection, schedule.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [allGroups, saved, bs] = await Promise.all([
+        const [allGroups, saved, sched] = await Promise.all([
           listGroups(),
           loadSelection().catch(() => null),
           loadBrowserSchedule().catch(() => null),
         ]);
         if (cancelled) return;
         setGroups(allGroups);
-        if (bs) setBrowserSched(bs);
+        if (sched) setSchedule(sched);
         if (saved) {
           if (allGroups.some((g) => g.id === saved.sourceGroup)) setSourceGroup(saved.sourceGroup);
           setSelectedLookups(new Set(saved.lookups));
@@ -158,53 +132,45 @@ function App() {
     };
   }, [sourceGroup]);
 
-  // Scan every target group for an existing sync collector — feeds both the
-  // per-group schedule buttons and the "Scheduled syncs" overview panel.
+  // Schedule loop: while armed and the app is open, run when a cron
+  // occurrence is due. lastRun is claimed in the KV store BEFORE running so
+  // another open tab won't double-run; missed windows (app closed) surface
+  // as a due occurrence the moment the app reopens. Syncs are idempotent, so
+  // an occasional race costs nothing but a no-op.
   useEffect(() => {
-    if (!groups) return;
-    let cancelled = false;
-    const missing = groups.filter((g) => !g.isSearch && !(g.id in schedules)).map((g) => g.id);
-    if (missing.length === 0) return;
-    void Promise.all(
-      missing.map(async (gid) => [gid, await getSyncCollector(gid).catch(() => null)] as const),
-    ).then((entries) => {
-      if (!cancelled) setSchedules((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
-    });
-    return () => {
-      cancelled = true;
+    if (!schedule?.enabled) return;
+    const tick = async () => {
+      if (scheduleRunningRef.current) return;
+      const due = lastDue(schedule.cron, Date.now());
+      if (due === null || (schedule.lastRun !== null && due <= schedule.lastRun)) return;
+      scheduleRunningRef.current = true;
+      setScheduleRunning(true);
+      try {
+        const claimed = { ...schedule, lastRun: due };
+        await saveBrowserSchedule(claimed);
+        setSchedule(claimed);
+        appendLog('info', `scheduled sync due ${new Date(due).toLocaleString()} — running with your session`);
+        const res = await runHeadlessSync({
+          sourceGroup: schedule.sourceGroup,
+          lookups: schedule.lookups,
+          targetGroups: schedule.targetGroups,
+          deploy: schedule.deploy,
+        });
+        for (const l of res.lines) appendLog(l.kind, l.text);
+        const undeployed = res.committedGroups.filter((g) => !res.deployedGroups.includes(g));
+        if (undeployed.length > 0) setNeedsDeploy((prev) => new Set([...prev, ...undeployed]));
+        if (res.committedGroups.length === 0) appendLog('info', 'scheduled sync: everything already in sync');
+      } catch (e) {
+        appendLog('error', `scheduled sync failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        scheduleRunningRef.current = false;
+        setScheduleRunning(false);
+      }
     };
-  }, [groups, schedules]);
-
-  // Check the selected groups for stored sync credentials.
-  useEffect(() => {
-    let cancelled = false;
-    const missing = [...selectedGroups].filter((gid) => !(gid in groupSecrets));
-    if (missing.length === 0) return;
-    void Promise.all(
-      missing.map(async (gid) => [gid, await getSyncSecret(gid).catch(() => null)] as const),
-    ).then((entries) => {
-      if (!cancelled) setGroupSecrets((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedGroups, groupSecrets]);
-
-  const scheduleScanDone = useMemo(
-    () => !!groups && groups.filter((g) => !g.isSearch).every((g) => g.id in schedules),
-    [groups, schedules],
-  );
-
-  const scheduledRows = useMemo(
-    () =>
-      (groups ?? [])
-        .filter((g) => !g.isSearch)
-        .flatMap((g) => {
-          const job = schedules[g.id];
-          return job ? [{ gid: g.id, job, parsed: parseSyncCollector(job) }] : [];
-        }),
-    [groups, schedules],
-  );
+    void tick();
+    const handle = setInterval(() => void tick(), 30_000);
+    return () => clearInterval(handle);
+  }, [schedule, appendLog]);
 
   const toggle = (set: Set<string>, id: string, apply: (next: Set<string>) => void) => {
     const next = new Set(set);
@@ -231,7 +197,7 @@ function App() {
     try {
       const sourceContent: Record<string, string> = {};
       const missingInSource: string[] = [];
-      const sourceErrors: string[] = [];
+      const errors: string[] = [];
       await Promise.all(
         [...selectedLookups].map(async (id) => {
           try {
@@ -244,13 +210,12 @@ function App() {
             else sourceContent[id] = content;
           } catch (e) {
             missingInSource.push(id);
-            sourceErrors.push(`[${sourceGroup}] ${id}: ${e instanceof Error ? e.message : String(e)}`);
+            errors.push(`[${sourceGroup}] ${id}: ${e instanceof Error ? e.message : String(e)}`);
           }
         }),
       );
 
       const present = Object.keys(sourceContent);
-      const cellErrors: string[] = [];
       const groupResults: Record<string, GroupCompare> = {};
       await Promise.all(
         [...selectedGroups].map(async (gid) => {
@@ -265,7 +230,7 @@ function App() {
               } catch (e) {
                 states[id] = 'error';
                 const msg = e instanceof Error ? e.message : String(e);
-                cellErrors.push(
+                errors.push(
                   msg.includes('Invalid context')
                     ? `[${gid}] ${id}: worker groups can't address this lookup — Cribl treats the dotted name as pack notation ` +
                       `("${id.split('.')[0]}" would be a pack). Rename the export in Search (no dots before .csv) to sync it.`
@@ -278,19 +243,15 @@ function App() {
           try {
             pendingFiles = await pendingLookupFiles(gid, present);
           } catch (e) {
-            cellErrors.push(`[${gid}] version/status failed: ${e instanceof Error ? e.message : String(e)}`);
+            errors.push(`[${gid}] version/status failed: ${e instanceof Error ? e.message : String(e)}`);
           }
           groupResults[gid] = { states, pendingFiles };
         }),
       );
 
       setCompare({ sourceGroup, sourceContent, missingInSource, groups: groupResults });
-      for (const id of missingInSource) {
-        appendLog('error', `${id} not found in ${sourceGroup} — skipped`);
-      }
-      for (const msg of [...sourceErrors, ...cellErrors]) {
-        appendLog('error', msg);
-      }
+      for (const id of missingInSource) appendLog('error', `${id} not found in ${sourceGroup} — skipped`);
+      for (const msg of errors) appendLog('error', msg);
     } catch (e) {
       appendLog('error', `compare failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -367,50 +328,8 @@ function App() {
 
   const cronValid = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(cron.trim());
 
-  // Browser-schedule loop: while armed and the app is open, run when a cron
-  // occurrence is due. lastRun is claimed in the KV store BEFORE running so
-  // another open tab won't double-run; missed windows (app closed) surface as
-  // a due occurrence the moment the app reopens. Syncs are idempotent, so an
-  // occasional race costs nothing but a no-op.
-  useEffect(() => {
-    if (!browserSched?.enabled) return;
-    const tick = async () => {
-      if (browserRunningRef.current) return;
-      const due = lastDue(browserSched.cron, Date.now());
-      if (due === null || (browserSched.lastRun !== null && due <= browserSched.lastRun)) return;
-      browserRunningRef.current = true;
-      setBrowserRunning(true);
-      try {
-        const claimed = { ...browserSched, lastRun: due };
-        await saveBrowserSchedule(claimed);
-        setBrowserSched(claimed);
-        appendLog('info', `in-app schedule: sync due ${new Date(due).toLocaleString()} — running with your session`);
-        const res = await runHeadlessSync({
-          sourceGroup: browserSched.sourceGroup,
-          lookups: browserSched.lookups,
-          targetGroups: browserSched.targetGroups,
-          deploy: browserSched.deploy,
-        });
-        for (const l of res.lines) appendLog(l.kind, l.text);
-        const undeployed = res.committedGroups.filter((g) => !res.deployedGroups.includes(g));
-        if (undeployed.length > 0) {
-          setNeedsDeploy((prev) => new Set([...prev, ...undeployed]));
-        }
-        if (res.committedGroups.length === 0) appendLog('info', 'in-app schedule: everything already in sync');
-      } catch (e) {
-        appendLog('error', `in-app schedule run failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        browserRunningRef.current = false;
-        setBrowserRunning(false);
-      }
-    };
-    void tick();
-    const handle = setInterval(() => void tick(), 30_000);
-    return () => clearInterval(handle);
-  }, [browserSched, appendLog]);
-
-  const armBrowserSchedule = async () => {
-    setConfirmBrowserSchedule(false);
+  const armSchedule = async () => {
+    setConfirmScheduleOpen(false);
     const sched: BrowserSchedule = {
       enabled: true,
       cron: cron.trim(),
@@ -422,85 +341,22 @@ function App() {
     };
     try {
       await saveBrowserSchedule(sched);
-      setBrowserSched(sched);
-      appendLog('success', `in-app schedule enabled: ${sched.cron} — ${sched.lookups.join(', ')} → ${sched.targetGroups.join(', ')}`);
+      setSchedule(sched);
+      appendLog('success', `scheduled sync enabled: ${sched.cron} — ${sched.lookups.join(', ')} → ${sched.targetGroups.join(', ')}`);
     } catch (e) {
-      appendLog('error', `failed to save in-app schedule: ${e instanceof Error ? e.message : String(e)}`);
+      appendLog('error', `failed to save schedule: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
-  const disarmBrowserSchedule = async () => {
-    if (!browserSched) return;
-    const sched = { ...browserSched, enabled: false };
+  const disarmSchedule = async () => {
+    if (!schedule) return;
+    const sched = { ...schedule, enabled: false };
     try {
       await saveBrowserSchedule(sched);
-      setBrowserSched(sched);
-      appendLog('info', 'in-app schedule disabled');
+      setSchedule(sched);
+      appendLog('info', 'scheduled sync disabled');
     } catch (e) {
-      appendLog('error', `failed to disable in-app schedule: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  };
-
-  const runSaveSchedule = async (gid: string) => {
-    setConfirmSchedule(null);
-    setSchedBusy(gid);
-    try {
-      const exists = !!schedules[gid];
-      const secretExists = !!groupSecrets[gid];
-      const credsEntered = credId.trim() !== '' && credSecret !== '';
-      if (!secretExists && !credsEntered) {
-        appendLog('error', `[${gid}] no credentials: enter a client id and secret (stored encrypted in the group's secrets store)`);
-        return;
-      }
-      if (credsEntered) {
-        await upsertSyncSecret(gid, { username: credId.trim(), password: credSecret }, secretExists);
-        setGroupSecrets((prev) => ({ ...prev, [gid]: { id: SYNC_SECRET_ID, username: credId.trim() } }));
-      }
-      const job = buildSyncCollector({
-        targetGroup: gid,
-        sourceGroup,
-        lookups: [...selectedLookups],
-        cronSchedule: cron.trim(),
-        deployDelay,
-        deploy: deployAfter,
-        enabled: schedEnabled,
-        baseUrl: baseUrl.trim().replace(/\/$/, ''),
-        authMode,
-      });
-      await upsertSyncCollector(gid, job, exists);
-      const files = await pendingScheduleFiles(gid);
-      const commit = await commitFiles(
-        gid,
-        files,
-        `${exists ? 'update' : 'create'} ${SYNC_COLLECTOR_ID} collector (Lookup Sync app)`,
-      );
-      appendLog('success', `[${gid}] ${exists ? 'updated' : 'created'} ${SYNC_COLLECTOR_ID}, committed ${commit.slice(0, 8)} (${files.length} files) — deploy to activate`);
-      setSchedules((prev) => ({ ...prev, [gid]: job }));
-      setNeedsDeploy((prev) => new Set(prev).add(gid));
-      setCredSecret('');
-    } catch (e) {
-      appendLog('error', `[${gid}] schedule save failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setSchedBusy(null);
-    }
-  };
-
-  const runRemoveSchedule = async (gid: string) => {
-    setConfirmSchedule(null);
-    setSchedBusy(gid);
-    try {
-      await deleteSyncCollector(gid);
-      await deleteSyncSecret(gid);
-      const files = await pendingScheduleFiles(gid);
-      const commit = await commitFiles(gid, files, `remove ${SYNC_COLLECTOR_ID} collector and credentials (Lookup Sync app)`);
-      appendLog('success', `[${gid}] removed ${SYNC_COLLECTOR_ID} and its credentials secret, committed ${commit.slice(0, 8)} — deploy to apply`);
-      setSchedules((prev) => ({ ...prev, [gid]: null }));
-      setGroupSecrets((prev) => ({ ...prev, [gid]: null }));
-      setNeedsDeploy((prev) => new Set(prev).add(gid));
-    } catch (e) {
-      appendLog('error', `[${gid}] schedule remove failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setSchedBusy(null);
+      appendLog('error', `failed to disable schedule: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -625,7 +481,7 @@ function App() {
           Compare
         </Button>
         {plan && plan.perGroup.length > 0 && (
-          <Button variant="primary" appearance="default" disabled={syncing} pending={syncing} onClick={() => setConfirmSyncOpen(true)}>
+          <Button variant="primary" disabled={syncing} pending={syncing} onClick={() => setConfirmSyncOpen(true)}>
             {`Sync & commit (${plan.totalChanges} change${plan.totalChanges === 1 ? '' : 's'})`}
           </Button>
         )}
@@ -678,6 +534,66 @@ function App() {
         </section>
       )}
 
+      <section className="panel">
+        <div className="panel-header">
+          <span className="pick-label">
+            <ClockOutlined />
+            <Text variant="body-md-semibold">Scheduled sync</Text>
+            <Tag size="sm" color="criblTeal">no credentials — uses your session</Tag>
+            {scheduleRunning && <Spinner size="sm" />}
+          </span>
+          {schedule?.enabled ? (
+            <Button size="sm" variant="secondary" onClick={() => void disarmSchedule()}>
+              Disable
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={selectedLookups.size === 0 || selectedGroups.size === 0 || !cronValid}
+              onClick={() => setConfirmScheduleOpen(true)}
+            >
+              Enable
+            </Button>
+          )}
+        </div>
+        {schedule?.enabled ? (
+          <Text color="secondary">
+            Runs <Text variant="code">{schedule.cron}</Text> while this app is open:{' '}
+            {schedule.lookups.join(', ')} from {schedule.sourceGroup} into{' '}
+            {schedule.targetGroups.join(', ')}
+            {schedule.deploy ? ', then deploys' : ' (commit only)'}. Last run:{' '}
+            {schedule.lastRun ? new Date(schedule.lastRun).toLocaleString() : 'never'}; next:{' '}
+            {(() => {
+              const n = nextDue(schedule.cron, Date.now());
+              return n ? new Date(n).toLocaleString() : 'unknown';
+            })()}. Missed windows run as soon as the app is reopened.
+          </Text>
+        ) : (
+          <>
+            <Text color="secondary">
+              The sync runs inside this app with your signed-in session — no credentials, no
+              collectors, nothing on workers. It runs while someone has the app open; missed
+              windows are caught up on open, and unchanged lookups are no-ops. Enable uses the
+              current lookup and group selection above.
+            </Text>
+            <div className="schedule-form">
+              <TextField
+                label="Cron schedule"
+                value={cron}
+                onChange={setCron}
+                appearance={cronValid ? 'default' : 'danger'}
+                placeholder="0 7 * * *"
+                helperText="When the sync runs (your local time, while the app is open)"
+              />
+              <Checkbox checked={deployAfter} onChange={() => setDeployAfter((v) => !v)}>
+                Deploy after sync
+              </Checkbox>
+            </div>
+          </>
+        )}
+      </section>
+
       {needsDeploy.size > 0 && (
         <section className="panel">
           <div className="panel-header">
@@ -693,260 +609,6 @@ function App() {
               </Button>
             ))}
           </div>
-        </section>
-      )}
-
-      {selectedGroups.size > 0 && (
-        <section className="panel">
-          <div className="panel-header">
-            <span className="pick-label">
-              <ClockOutlined />
-              <Text variant="body-md-semibold">Scheduled sync (Script collector)</Text>
-            </span>
-          </div>
-          <Text as="p" color="secondary">
-            For hands-off syncs, each target group runs the sync on a schedule via a Script
-            collector named <Text variant="code">{SYNC_COLLECTOR_ID}</Text>. The sync script is
-            embedded in the collector config and API credentials live in the group's encrypted
-            secrets store — no SSH, no files on worker nodes, works with Cribl.Cloud-managed
-            workers. The collector bakes in the currently selected lookups
-            ({selectedLookups.size ? [...selectedLookups].join(', ') : 'none selected'}) and
-            source group ({sourceGroup}). Only requirement on workers: <Text variant="code">python3</Text>.
-          </Text>
-          <div className="browser-sched">
-            <div className="panel-header">
-              <span className="pick-label">
-                <Text variant="body-sm-semibold">In-app schedule</Text>
-                <Tag size="sm" color="criblTeal">no credentials — uses your session</Tag>
-                {browserRunning && <Spinner size="sm" />}
-              </span>
-              {browserSched?.enabled ? (
-                <Button size="sm" variant="secondary" onClick={() => void disarmBrowserSchedule()}>
-                  Disable
-                </Button>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={selectedLookups.size === 0 || selectedGroups.size === 0 || !cronValid}
-                  onClick={() => setConfirmBrowserSchedule(true)}
-                >
-                  Enable
-                </Button>
-              )}
-            </div>
-            {browserSched?.enabled ? (
-              <Text color="secondary">
-                Runs <Text variant="code">{browserSched.cron}</Text> while this app is open:{' '}
-                {browserSched.lookups.join(', ')} from {browserSched.sourceGroup} into{' '}
-                {browserSched.targetGroups.join(', ')}
-                {browserSched.deploy ? ', then deploys' : ' (commit only)'}. Last run:{' '}
-                {browserSched.lastRun ? new Date(browserSched.lastRun).toLocaleString() : 'never'}; next:{' '}
-                {(() => {
-                  const n = nextDue(browserSched.cron, Date.now());
-                  return n ? new Date(n).toLocaleString() : 'unknown';
-                })()}. Missed windows run as soon as the app is reopened.
-              </Text>
-            ) : (
-              <Text color="secondary">
-                Credential-less scheduling: the sync runs inside this app with your signed-in
-                session at the cron below — no secrets, no collector, nothing on workers. It only
-                runs while someone has the app open (missed windows are caught up on open). For
-                fully unattended syncs, use the worker collector below instead.
-              </Text>
-            )}
-          </div>
-          <div className="panel-header">
-            <Text variant="body-sm-semibold">Worker collector schedule (unattended)</Text>
-          </div>
-          <div className="schedule-form">
-            <div className="schedule-cred-fields">
-              <div className="source-picker">
-                <Text color="secondary">Auth</Text>
-                <select
-                  className="group-select"
-                  value={authMode}
-                  onChange={(e) => setAuthMode(e.target.value as SyncAuthMode)}
-                >
-                  <option value="cloud">Cloud API credentials</option>
-                  <option value="local">Local username/password</option>
-                </select>
-              </div>
-              <TextField
-                label="Leader URL"
-                value={baseUrl}
-                onChange={setBaseUrl}
-                placeholder="https://main-<org>.cribl.cloud"
-                helperText="Workspace/leader URL the worker-side script calls"
-              />
-              <TextField
-                label={authMode === 'cloud' ? 'Client ID' : 'Username'}
-                value={credId}
-                onChange={setCredId}
-                helperText={`Stored encrypted as group secret '${SYNC_SECRET_ID}'`}
-              />
-              <PasswordField
-                label={authMode === 'cloud' ? 'Client secret' : 'Password'}
-                value={credSecret}
-                onChange={setCredSecret}
-                helperText="Leave blank to keep a group's already-stored credentials"
-              />
-            </div>
-            <TextField
-              label="Cron schedule"
-              value={cron}
-              onChange={setCron}
-              appearance={cronValid ? 'default' : 'danger'}
-              placeholder="0 7 * * *"
-              helperText="When the sync runs (leader's clock)"
-            />
-            <NumberField
-              label="Deploy delay (seconds)"
-              value={deployDelay}
-              min={5}
-              onChange={(v) => setDeployDelay(Number.isFinite(v) ? v : 30)}
-              helperText="Deploy restarts the worker running the sync — it's scheduled this many seconds later, from a detached process that survives the restart"
-            />
-            <Checkbox checked={deployAfter} onChange={() => setDeployAfter((v) => !v)}>
-              Deploy after sync (detached, delayed)
-            </Checkbox>
-            <Checkbox checked={schedEnabled} onChange={() => setSchedEnabled((v) => !v)}>
-              Schedule enabled
-            </Checkbox>
-          </div>
-          <Text color="tertiary" variant="body-xs-normal">
-            Credentials need rights to read Search knowledge and edit/commit/deploy the target
-            group. They're delivered to the script at run time via C.Secret() in the collector's
-            environment variables — never in plain text in config or git.
-          </Text>
-          <ul className="schedule-list">
-            {[...selectedGroups].map((gid) => {
-              const existing = schedules[gid];
-              const loaded = gid in schedules && gid in groupSecrets;
-              const hasCreds = !!groupSecrets[gid] || (credId.trim() !== '' && credSecret !== '');
-              return (
-                <li key={gid} className="schedule-row">
-                  <span className="pick-label">
-                    <Text variant="body-sm-semibold">{gid}</Text>
-                    {!loaded ? (
-                      <Spinner size="sm" />
-                    ) : existing ? (
-                      <Tag size="sm" color={existing.schedule?.enabled ? 'success' : 'default'}>
-                        {`${existing.schedule?.enabled ? 'scheduled' : 'disabled'} · ${existing.schedule?.cronSchedule ?? '?'}`}
-                      </Tag>
-                    ) : (
-                      <Tag size="sm" color="default">no schedule</Tag>
-                    )}
-                    {loaded && (
-                      groupSecrets[gid] ? (
-                        <Tag size="sm" color="criblTeal">{`credentials stored${groupSecrets[gid]?.username ? ` · ${groupSecrets[gid]?.username}` : ''}`}</Tag>
-                      ) : (
-                        <Tag size="sm" color="amber">no credentials yet</Tag>
-                      )
-                    )}
-                  </span>
-                  <span className="schedule-row-actions">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={!loaded || selectedLookups.size === 0 || !cronValid || !baseUrl.trim() || !hasCreds || schedBusy !== null}
-                      pending={schedBusy === gid}
-                      onClick={() => setConfirmSchedule({ gid, action: 'save' })}
-                    >
-                      {existing ? 'Update schedule' : 'Create schedule'}
-                    </Button>
-                    {existing && (
-                      <Button
-                        size="sm"
-                        variant="tertiary"
-                        appearance="danger"
-                        disabled={schedBusy !== null}
-                        onClick={() => setConfirmSchedule({ gid, action: 'remove' })}
-                      >
-                        Remove
-                      </Button>
-                    )}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        </section>
-      )}
-
-      {groups !== null && (
-        <section className="panel">
-          <div className="panel-header">
-            <span className="pick-label">
-              <Text variant="body-md-semibold">Scheduled syncs</Text>
-              {!scheduleScanDone && <Spinner size="sm" />}
-            </span>
-            <Button
-              size="sm"
-              variant="tertiary"
-              leadingIcon={ReloadOutlined}
-              disabled={!scheduleScanDone || schedBusy !== null}
-              onClick={() => setSchedules({})}
-            >
-              Rescan
-            </Button>
-          </div>
-          {scheduledRows.length === 0 ? (
-            <Text color="secondary">
-              {scheduleScanDone
-                ? `No group has a ${SYNC_COLLECTOR_ID} collector yet — select target groups above to create one.`
-                : 'Scanning groups…'}
-            </Text>
-          ) : (
-            <div className="status-scroll">
-              <table className="status-table">
-                <thead>
-                  <tr>
-                    <th><Text color="secondary" variant="body-xs-normal">group</Text></th>
-                    <th><Text color="secondary" variant="body-xs-normal">lookups</Text></th>
-                    <th><Text color="secondary" variant="body-xs-normal">source</Text></th>
-                    <th><Text color="secondary" variant="body-xs-normal">schedule</Text></th>
-                    <th><Text color="secondary" variant="body-xs-normal">after sync</Text></th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {scheduledRows.map(({ gid, job, parsed }) => (
-                    <tr key={gid}>
-                      <td><Text variant="body-sm-semibold">{gid}</Text></td>
-                      <td><Text variant="code">{parsed.lookups.join(', ') || '—'}</Text></td>
-                      <td><Text variant="code">{parsed.sourceGroup}</Text></td>
-                      <td>
-                        <span className="pick-label">
-                          <Text variant="code">{job.schedule?.cronSchedule ?? '?'}</Text>
-                          <Tag size="sm" color={job.schedule?.enabled ? 'success' : 'default'}>
-                            {job.schedule?.enabled ? 'enabled' : 'disabled'}
-                          </Tag>
-                        </span>
-                      </td>
-                      <td>
-                        <Text color="secondary">
-                          {parsed.deployDelay !== null ? `deploy after ${parsed.deployDelay}s` : 'commit only'}
-                        </Text>
-                      </td>
-                      <td>
-                        <Button
-                          size="sm"
-                          variant="tertiary"
-                          appearance="danger"
-                          disabled={schedBusy !== null}
-                          pending={schedBusy === gid}
-                          onClick={() => setConfirmSchedule({ gid, action: 'remove' })}
-                        >
-                          Remove
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
         </section>
       )}
 
@@ -1003,68 +665,12 @@ function App() {
       </Modal>
 
       <Modal
-        isOpen={confirmSchedule !== null}
-        title={
-          confirmSchedule?.action === 'remove'
-            ? `Remove scheduled sync from ${confirmSchedule?.gid}?`
-            : `${schedules[confirmSchedule?.gid ?? ''] ? 'Update' : 'Create'} scheduled sync in ${confirmSchedule?.gid}?`
-        }
-        confirmButtonText={confirmSchedule?.action === 'remove' ? 'Remove & commit' : 'Save & commit'}
-        cancelButtonText="Cancel"
-        onConfirm={() =>
-          confirmSchedule &&
-          void (confirmSchedule.action === 'remove'
-            ? runRemoveSchedule(confirmSchedule.gid)
-            : runSaveSchedule(confirmSchedule.gid))
-        }
-        onClose={() => setConfirmSchedule(null)}
-      >
-        {confirmSchedule?.action === 'remove' ? (
-          <Text as="p">
-            This deletes the <Text variant="code">{SYNC_COLLECTOR_ID}</Text> collector and its{' '}
-            <Text variant="code">{SYNC_SECRET_ID}</Text> credentials secret from{' '}
-            <Text variant="body-md-semibold">{confirmSchedule.gid}</Text> and commits the change
-            (scoped to those config files only). Scheduled syncs stop after the next deploy.
-            This cannot be undone from this app.
-          </Text>
-        ) : (
-          <div className="confirm-body">
-            <Text as="p">
-              This {schedules[confirmSchedule?.gid ?? ''] ? 'overwrites the existing' : 'creates a'}{' '}
-              <Text variant="code">{SYNC_COLLECTOR_ID}</Text> Script collector in{' '}
-              <Text variant="body-md-semibold">{confirmSchedule?.gid}</Text>
-              {credId.trim() && credSecret
-                ? <> , stores the entered credentials encrypted as group secret <Text variant="code">{SYNC_SECRET_ID}</Text>,</>
-                : ' (keeping the group’s stored credentials)'}{' '}
-              and commits — scoped to those config files only. The schedule takes effect after
-              the next deploy, which also distributes the credentials to the workers.
-            </Text>
-            <ul className="confirm-spec">
-              <li><Text color="secondary">Lookups:</Text> <Text variant="code">{[...selectedLookups].join(', ')}</Text></li>
-              <li><Text color="secondary">Source group:</Text> <Text variant="code">{sourceGroup}</Text></li>
-              <li><Text color="secondary">Schedule:</Text> <Text variant="code">{cron.trim()}</Text> ({schedEnabled ? 'enabled' : 'disabled'})</li>
-              <li><Text color="secondary">Leader URL:</Text> <Text variant="code">{baseUrl.trim()}</Text></li>
-              <li><Text color="secondary">Auth:</Text> {authMode === 'cloud' ? 'Cloud API credentials' : 'Local username/password'}</li>
-              <li>
-                <Text color="secondary">After sync:</Text>{' '}
-                {deployAfter ? `commit + detached deploy ${deployDelay}s later` : 'commit only (deploy manually)'}
-              </li>
-            </ul>
-            <Text as="p" color="secondary">
-              No worker-node setup is needed — the sync script ships inside the collector config
-              and credentials are resolved on the worker via C.Secret().
-            </Text>
-          </div>
-        )}
-      </Modal>
-
-      <Modal
-        isOpen={confirmBrowserSchedule}
-        title="Enable in-app scheduled sync?"
+        isOpen={confirmScheduleOpen}
+        title="Enable scheduled sync?"
         confirmButtonText="Enable"
         cancelButtonText="Cancel"
-        onConfirm={() => void armBrowserSchedule()}
-        onClose={() => setConfirmBrowserSchedule(false)}
+        onConfirm={() => void armSchedule()}
+        onClose={() => setConfirmScheduleOpen(false)}
       >
         <div className="confirm-body">
           <Text as="p">

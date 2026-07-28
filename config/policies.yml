@@ -20,16 +20,6 @@ policies:
   # Read raw lookup file content for comparison.
   - object: '/m/:gid/system/lookups/:lid/content'
     actions: ['GET']
-  # Store scheduled-sync API credentials in the group's encrypted secrets store.
-  - object: '/m/:gid/system/secrets'
-    actions: ['GET', 'POST']
-  - object: '/m/:gid/system/secrets/:sid'
-    actions: ['GET', 'PATCH', 'DELETE']
-  # Manage the scheduled sync-search-lookups Script collector.
-  - object: '/m/:gid/lib/jobs'
-    actions: ['GET', 'POST']
-  - object: '/m/:gid/lib/jobs/:jid'
-    actions: ['GET', 'PATCH', 'DELETE']
   # Detect uncommitted lookup files to scope (and recover) commits.
   - object: '/m/:gid/version/status'
     actions: ['GET']

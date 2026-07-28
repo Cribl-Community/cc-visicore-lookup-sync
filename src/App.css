@@ -142,51 +142,6 @@
   gap: token('spacing.lg');
 }
 
-.browser-sched {
-  display: flex;
-  flex-direction: column;
-  gap: token('spacing.sm');
-  padding: token('spacing.md');
-  border: token('border.default');
-  border-radius: token('radius.md');
-  background-color: token('color.background.accent.subtle');
-}
-
-.schedule-cred-fields {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: token('spacing.lg');
-  width: 100%;
-  padding-bottom: token('spacing.sm');
-  border-bottom: token('border.default');
-}
-
-.schedule-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-}
-
-.schedule-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: token('spacing.md');
-  padding: token('spacing.sm') 0;
-  border-bottom: token('border.default');
-}
-
-.schedule-row:last-child {
-  border-bottom: none;
-}
-
-.schedule-row-actions {
-  display: flex;
-  align-items: center;
-  gap: token('spacing.sm');
-}
-
 .confirm-spec {
   list-style: none;
   display: flex;
