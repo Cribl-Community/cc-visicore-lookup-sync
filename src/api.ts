@@ -24,12 +24,26 @@ export interface Lookup {
 export type SyncState = 'in-sync' | 'stale' | 'missing' | 'error';
 
 /**
- * Worker-group lookup routes parse `x.y` ids as pack notation (pack `x`,
- * file `y`) and answer 500 "Invalid context x" — so Search-exported lookups
- * with dotted names (`saved-search.name.csv`) can't be addressed there.
+ * Search lists lookups that live inside a pack as `<pack>.<file>` (pack
+ * notation). Target groups don't have that pack, so the pack-prefixed id is
+ * unaddressable there (500 "Invalid context <pack>") — pack lookups sync
+ * into groups under their bare filename instead, like the UI's
+ * "Move → All Lookups".
  */
-export const hasDottedStem = (lookupId: string) =>
-  lookupId.replace(/\.[^.]+$/, '').includes('.');
+export const packPrefix = (lookupId: string): string | null => {
+  const stem = lookupId.replace(/\.[^.]+$/, '');
+  const dot = stem.indexOf('.');
+  return dot === -1 ? null : lookupId.slice(0, dot);
+};
+
+/** The id a lookup syncs to in a target group: pack lookups are de-packed. */
+export const targetLookupId = (lookupId: string): string => {
+  const prefix = packPrefix(lookupId);
+  return prefix ? lookupId.slice(prefix.length + 1) : lookupId;
+};
+
+/** False when even the de-packed name is still pack notation (nested dots). */
+export const isSyncable = (lookupId: string) => packPrefix(targetLookupId(lookupId)) === null;
 
 async function request(
   method: string,

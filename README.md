@@ -78,15 +78,18 @@ approach instead; the two coexist fine.
   worker nodes. The signed-in user needs rights to read Search knowledge and
   edit/commit/deploy the target groups.
 
-## Known limitation: dotted lookup names
+## Pack lookups
 
-Search-exported lookups named `<saved-search>.<name>.csv` (a dot in the base
-name) **cannot be synced into worker groups**: Cribl's group lookup routes
-parse `x.y` ids as pack notation (pack `x`, file `y`) and answer
-`500 Invalid context x`. The app flags these in the source list and marks
-them `not syncable` in the status matrix. Fix: rename the export in your
-Search query — `| export to lookup gcp_vpcflow_direction.csv` instead of
-letting it inherit the saved-search prefix.
+Search lists lookups that live inside a pack as `<pack>.<file>.csv` (pack
+notation). Target groups don't have that pack, so the pack-prefixed id is
+unaddressable there (`500 Invalid context <pack>`). The app handles this the
+same way the Cribl UI's "Move → All Lookups" does: pack lookups sync into
+the target group's **global knowledge under their bare filename** —
+`starlink.status_lookup.csv` arrives as `status_lookup.csv`, and that's the
+name pipelines reference. These rows are tagged `pack` in the source list,
+the status matrix shows the rename (`pack.name.csv → name.csv`), and the
+compare step refuses selections where two pack lookups would collide on the
+same bare name.
 
 ## Development
 

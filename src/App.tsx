@@ -5,13 +5,15 @@ import {
   commitFiles,
   deployGroup,
   getRawContent,
-  hasDottedStem,
+  isSyncable,
   listGroups,
   listLookups,
   loadSelection,
   lookupExists,
+  packPrefix,
   pendingLookupFiles,
   saveSelection,
+  targetLookupId,
   upsertLookup,
   type Group,
   type Lookup,
@@ -29,6 +31,8 @@ interface GroupCompare {
 interface CompareResult {
   sourceGroup: string;
   sourceContent: Record<string, string>;
+  /** Source lookup id -> id it syncs to in target groups (pack lookups are de-packed). */
+  targetIds: Record<string, string>;
   missingInSource: string[];
   groups: Record<string, GroupCompare>;
 }
@@ -172,6 +176,27 @@ function App() {
         }),
       );
 
+      // Pack lookups sync under their bare filename — map each source id to
+      // its target id, and refuse pairs that would collide on the same name.
+      const targetIds: Record<string, string> = {};
+      const byTarget = new Map<string, string[]>();
+      for (const id of Object.keys(sourceContent)) {
+        if (!isSyncable(id)) {
+          errors.push(`${id}: still pack notation after de-packing — can't be written to a group; rename the export in Search`);
+          delete sourceContent[id];
+          continue;
+        }
+        const tid = targetLookupId(id);
+        targetIds[id] = tid;
+        byTarget.set(tid, [...(byTarget.get(tid) ?? []), id]);
+      }
+      for (const [tid, ids] of byTarget) {
+        if (ids.length > 1) {
+          errors.push(`${ids.join(' and ')} would both sync as ${tid} — deselect all but one`);
+          for (const id of ids) delete sourceContent[id];
+        }
+      }
+
       const present = Object.keys(sourceContent);
       const groupResults: Record<string, GroupCompare> = {};
       await Promise.all(
@@ -182,23 +207,18 @@ function App() {
               // One bad lookup must not sink the whole comparison — record
               // the failure per cell and keep going.
               try {
-                const target = (await lookupExists(gid, id)) ? await getRawContent(gid, id) : null;
+                const tid = targetIds[id];
+                const target = (await lookupExists(gid, tid)) ? await getRawContent(gid, tid) : null;
                 states[id] = target === null ? 'missing' : target === sourceContent[id] ? 'in-sync' : 'stale';
               } catch (e) {
                 states[id] = 'error';
-                const msg = e instanceof Error ? e.message : String(e);
-                errors.push(
-                  msg.includes('Invalid context')
-                    ? `[${gid}] ${id}: worker groups can't address this lookup — Cribl treats the dotted name as pack notation ` +
-                      `("${id.split('.')[0]}" would be a pack). Rename the export in Search (no dots before .csv) to sync it.`
-                    : `[${gid}] ${id}: ${msg}`,
-                );
+                errors.push(`[${gid}] ${id}: ${e instanceof Error ? e.message : String(e)}`);
               }
             }),
           );
           let pendingFiles: string[] = [];
           try {
-            pendingFiles = await pendingLookupFiles(gid, present);
+            pendingFiles = await pendingLookupFiles(gid, present.map((id) => targetIds[id]));
           } catch (e) {
             errors.push(`[${gid}] version/status failed: ${e instanceof Error ? e.message : String(e)}`);
           }
@@ -206,7 +226,7 @@ function App() {
         }),
       );
 
-      setCompare({ sourceGroup, sourceContent, missingInSource, groups: groupResults });
+      setCompare({ sourceGroup, sourceContent, targetIds, missingInSource, groups: groupResults });
       for (const id of missingInSource) appendLog('error', `${id} not found in ${sourceGroup} — skipped`);
       for (const msg of errors) appendLog('error', msg);
     } catch (e) {
@@ -240,12 +260,13 @@ function App() {
         const { gid } = groupPlan;
         try {
           for (const { id } of groupPlan.changed) {
-            appendLog('info', `[${gid}] syncing ${id} (${compare.sourceContent[id].length} bytes)`);
-            await upsertLookup(gid, id, compare.sourceContent[id]);
+            const tid = compare.targetIds[id];
+            appendLog('info', `[${gid}] syncing ${id}${tid !== id ? ` as ${tid}` : ''} (${compare.sourceContent[id].length} bytes)`);
+            await upsertLookup(gid, tid, compare.sourceContent[id]);
           }
           // Commit whatever this run changed PLUS any lookup files a
           // previous run left staged-but-uncommitted.
-          const files = await pendingLookupFiles(gid, Object.keys(compare.sourceContent));
+          const files = await pendingLookupFiles(gid, Object.values(compare.targetIds));
           if (files.length === 0) {
             appendLog('info', `[${gid}] nothing to commit`);
             continue;
@@ -305,15 +326,6 @@ function App() {
           query exports Lake data with <Text variant="code">export to lookup</Text>, and this
           app makes the result usable by Stream pipelines.
         </Text>
-        {(lookups ?? []).some((l) => hasDottedStem(l.id)) && (
-          <Text as="p" color="tertiary" variant="body-xs-normal">
-            <Tag size="sm" color="amber">won't sync</Tag> marks lookups with a dot in their base
-            name (Search's <Text variant="code">saved-search.name.csv</Text> export pattern) —
-            Cribl's worker-group API reads <Text variant="code">x.y</Text> as pack notation, so
-            these can't be written into a group. To sync one, rename the export in your Search
-            query, e.g. <Text variant="code">| export to lookup name.csv</Text>.
-          </Text>
-        )}
       </header>
 
       {loadError && (
@@ -386,13 +398,22 @@ function App() {
                         <span className="row-name" title={l.id}>
                           <Text variant="code">{l.id}</Text>
                         </span>
-                        {hasDottedStem(l.id) && (
-                          <span
-                            className="row-tag"
-                            title="Worker groups treat the dotted name as pack notation — rename the export in Search to sync it"
-                          >
-                            <Tag size="sm" color="amber">won't sync</Tag>
-                          </span>
+                        {packPrefix(l.id) !== null && (
+                          isSyncable(l.id) ? (
+                            <span
+                              className="row-tag"
+                              title={`From pack '${packPrefix(l.id)}' — syncs to groups as '${targetLookupId(l.id)}'`}
+                            >
+                              <Tag size="sm" color="iris">pack</Tag>
+                            </span>
+                          ) : (
+                            <span
+                              className="row-tag"
+                              title="Still pack notation after removing the pack prefix — rename the export in Search to sync it"
+                            >
+                              <Tag size="sm" color="amber">won't sync</Tag>
+                            </span>
+                          )
                         )}
                         <span className="row-meta">
                           <Text color="tertiary" variant="body-xs-normal">{lookupMeta(l)}</Text>
@@ -499,7 +520,12 @@ function App() {
               <tbody>
                 {Object.keys(compare.sourceContent).map((id) => (
                   <tr key={id}>
-                    <td><Text variant="code">{id}</Text></td>
+                    <td>
+                      <Text variant="code">{id}</Text>
+                      {compare.targetIds[id] !== id && (
+                        <Text color="tertiary" variant="body-xs-normal">{` → ${compare.targetIds[id]}`}</Text>
+                      )}
+                    </td>
                     {Object.entries(compare.groups).map(([gid, g]) => {
                       const s = g.states[id];
                       return (
@@ -578,8 +604,11 @@ function App() {
               <ul>
                 {g.changed.map(({ id, state }) => (
                   <li key={id}>
-                    <Text variant="code">{id}</Text>{' '}
-                    <Text color="secondary">({state === 'missing' ? 'create' : 'overwrite'})</Text>
+                    <Text variant="code">{compare?.targetIds[id] ?? id}</Text>{' '}
+                    <Text color="secondary">
+                      ({state === 'missing' ? 'create' : 'overwrite'}
+                      {compare && compare.targetIds[id] !== id ? `, from pack lookup ${id}` : ''})
+                    </Text>
                   </li>
                 ))}
                 {g.pendingFiles.length > 0 && (
