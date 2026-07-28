@@ -1,0 +1,324 @@
+/**
+ * Cribl REST API layer for the Lookup Sync app.
+ *
+ * Port of vct-cribl-lookup-sync/sync_search_lookup.py. Auth is handled by
+ * the platform fetch proxy, so unlike the script there are no credentials
+ * here — every call is a plain fetch() against CRIBL_API_URL.
+ */
+
+const api = () => window.CRIBL_API_URL;
+
+export interface Group {
+  id: string;
+  isFleet?: boolean;
+  isSearch?: boolean;
+  workerCount?: number;
+  description?: string;
+}
+
+export interface Lookup {
+  id: string;
+  size?: number;
+  rows?: number;
+}
+
+export type SyncState = 'in-sync' | 'stale' | 'missing' | 'error';
+
+/**
+ * Worker-group lookup routes parse `x.y` ids as pack notation (pack `x`,
+ * file `y`) and answer 500 "Invalid context x" — so Search-exported lookups
+ * with dotted names (`saved-search.name.csv`) can't be addressed there.
+ */
+export const hasDottedStem = (lookupId: string) =>
+  lookupId.replace(/\.[^.]+$/, '').includes('.');
+
+async function request(
+  method: string,
+  path: string,
+  opts: { body?: BodyInit; contentType?: string; ok404?: boolean } = {},
+): Promise<Response> {
+  const headers: Record<string, string> = {};
+  if (opts.contentType) headers['Content-Type'] = opts.contentType;
+  const resp = await fetch(api() + path, { method, headers, body: opts.body });
+  if (!resp.ok && !(opts.ok404 && resp.status === 404)) {
+    const text = (await resp.text()).slice(0, 300);
+    throw new Error(`${method} ${path} failed: HTTP ${resp.status} ${text}`);
+  }
+  return resp;
+}
+
+const getJson = async <T>(path: string): Promise<T> =>
+  (await request('GET', path)).json() as Promise<T>;
+
+interface Items<T> {
+  items?: T[];
+}
+
+/** All config groups: worker groups, Edge fleets, and Search groups. */
+export async function listGroups(): Promise<Group[]> {
+  const data = await getJson<Items<Group>>('/master/groups');
+  return data.items ?? [];
+}
+
+export async function listLookups(group: string): Promise<Lookup[]> {
+  const data = await getJson<Items<Lookup>>(`/m/${group}/system/lookups`);
+  return data.items ?? [];
+}
+
+/**
+ * True if the lookup object exists in the group. Deliberately probes the
+ * object endpoint: /content answers HTTP 500 ("socket hang up"), not 404,
+ * for a missing lookup, so it cannot be used as an existence check.
+ */
+export async function lookupExists(group: string, lookupId: string): Promise<boolean> {
+  const resp = await request('GET', `/m/${group}/system/lookups/${lookupId}`, { ok404: true });
+  if (resp.status === 404) return false;
+  const data = (await resp.json()) as Items<Lookup>;
+  return (data.items ?? []).length > 0;
+}
+
+/**
+ * The lookup's raw file content. raw=true is required — without it the API
+ * returns parsed JSON rows with an internal __id column, not the file.
+ */
+export async function getRawContent(group: string, lookupId: string): Promise<string | null> {
+  const resp = await request(
+    'GET',
+    `/m/${group}/system/lookups/${lookupId}/content?raw=true`,
+    { ok404: true },
+  );
+  return resp.status === 404 ? null : resp.text();
+}
+
+/**
+ * Upload content into a group's lookup (create or update).
+ *
+ * Cribl's content upload is a two-step dance:
+ *   1. PUT the raw bytes -> server stages them as a .tmp file.
+ *   2. Point the lookup object's fileInfo.filename at that temp file
+ *      (POST to create, PATCH to update). On PATCH, server-managed fields
+ *      (status, notifications) must be stripped before sending back.
+ */
+export async function upsertLookup(group: string, lookupId: string, content: string): Promise<void> {
+  const uploadResp = await request(
+    'PUT',
+    `/m/${group}/system/lookups?filename=${encodeURIComponent(lookupId)}`,
+    { body: content, contentType: 'text/csv' },
+  );
+  const { filename: tmpName } = (await uploadResp.json()) as { filename: string };
+
+  const objResp = await request('GET', `/m/${group}/system/lookups/${lookupId}`, { ok404: true });
+  const items = objResp.status === 404 ? [] : ((await objResp.json()) as Items<Record<string, unknown>>).items ?? [];
+  if (items.length === 0) {
+    await request('POST', `/m/${group}/system/lookups`, {
+      body: JSON.stringify({ id: lookupId, fileInfo: { filename: tmpName } }),
+      contentType: 'application/json',
+    });
+  } else {
+    const obj = { ...items[0] };
+    delete obj.status;
+    delete obj.notifications;
+    obj.fileInfo = { filename: tmpName };
+    await request('PATCH', `/m/${group}/system/lookups/${lookupId}`, {
+      body: JSON.stringify(obj),
+      contentType: 'application/json',
+    });
+  }
+}
+
+/** The two git paths a lookup owns in the group's config repo. */
+export function lookupPaths(group: string, lookupId: string): string[] {
+  const stem = lookupId.replace(/\.[^.]+$/, '');
+  const base = `groups/${group}/data/lookups`;
+  return [`${base}/${lookupId}`, `${base}/${stem}.yml`];
+}
+
+/**
+ * Of the given lookups' config paths, those with uncommitted changes per
+ * version/status. Scopes the commit, and recovers lookups a previous run
+ * uploaded but never committed.
+ */
+export async function pendingLookupFiles(group: string, lookupIds: string[]): Promise<string[]> {
+  const data = await getJson<Items<{ files?: { path: string }[] }>>(`/m/${group}/version/status`);
+  const pending = new Set((data.items?.[0]?.files ?? []).map((f) => f.path));
+  return lookupIds.flatMap((id) => lookupPaths(group, id)).filter((p) => pending.has(p));
+}
+
+/**
+ * Commit exactly the given file paths. The scoped "files" list is the
+ * load-bearing safety feature: unrelated pending changes in the group
+ * (a colleague's in-progress work, post-upgrade default/ churn) are never
+ * swept into the automated commit — or the deploy, which ships commits only.
+ */
+export async function commitFiles(group: string, files: string[], message: string): Promise<string> {
+  const resp = await request('POST', `/m/${group}/version/commit`, {
+    body: JSON.stringify({ message, files }),
+    contentType: 'application/json',
+  });
+  const data = (await resp.json()) as Items<{ commit: string }>;
+  return data.items?.[0]?.commit ?? '';
+}
+
+/** Deploy the group's latest committed config version. */
+export async function deployGroup(group: string): Promise<string> {
+  const data = await getJson<Items<string>>(`/master/groups/${group}/configVersion`);
+  const version = data.items?.[0];
+  if (!version) throw new Error(`no configVersion for group ${group}`);
+  await request('PATCH', `/master/groups/${group}/deploy`, {
+    body: JSON.stringify({ version }),
+    contentType: 'application/json',
+  });
+  return version;
+}
+
+// --- scheduled sync via Script collector ----------------------------------
+//
+// Mirrors collector-sync-search-lookups.json from the original repo: a
+// scheduled Script collector on the target group runs sync_search_lookup.py
+// on a worker node. The app manages the collector definition; the one thing
+// it cannot do is place the credentials env file on the worker nodes — that
+// remains a documented manual step.
+
+export const SYNC_COLLECTOR_ID = 'sync-search-lookups';
+export const WORKER_ENV_FILE = '~/.cribl-lookup-sync.env';
+
+const SCRIPT_URL =
+  'https://raw.githubusercontent.com/VisiCore/vct-cribl-lookup-sync/main/sync_search_lookup.py';
+
+export interface CollectorJob {
+  id: string;
+  description?: string;
+  schedule?: { enabled?: boolean; cronSchedule?: string; [key: string]: unknown };
+  collector?: { type?: string; conf?: Record<string, unknown>; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+export interface ScheduleSpec {
+  targetGroup: string;
+  sourceGroup: string;
+  lookups: string[];
+  cronSchedule: string;
+  deployDelay: number;
+  deploy: boolean;
+  enabled: boolean;
+}
+
+/** The jobs.yml config path a collector definition lives in — used to scope the commit. */
+export const jobsConfigPath = (group: string) => `groups/${group}/local/cribl/jobs.yml`;
+
+export function buildSyncCollector(spec: ScheduleSpec): CollectorJob {
+  const flags = [
+    ...spec.lookups.map((id) => `--lookup ${id}`),
+    `--source-group ${spec.sourceGroup}`,
+    `--target-group ${spec.targetGroup}`,
+    // --deploy-delay (not --deploy): a synchronous deploy would restart the
+    // very worker running the collector task before it can report success.
+    ...(spec.deploy ? [`--deploy-delay ${spec.deployDelay}`] : []),
+  ].join(' ');
+  const discoverScript = [
+    'set -e',
+    'ENV_FILE=$HOME/.cribl-lookup-sync.env',
+    'if [ ! -f "$ENV_FILE" ]; then echo "ERROR: $ENV_FILE not found on worker; see vct-cribl-lookup-sync README"; exit 1; fi',
+    '. "$ENV_FILE"',
+    `curl -fsSL ${SCRIPT_URL} -o /tmp/sync_search_lookup.py`,
+    `python3 /tmp/sync_search_lookup.py ${flags} 2>&1`,
+    '',
+  ].join('\n');
+  return {
+    id: SYNC_COLLECTOR_ID,
+    description:
+      `Scheduled sync of Cribl Search lookups (${spec.lookups.join(', ')}) from ` +
+      `${spec.sourceGroup} into ${spec.targetGroup}. Managed by the Lookup Sync app. ` +
+      `Creds in ${WORKER_ENV_FILE} on the worker node.`,
+    type: 'collection',
+    ttl: '4h',
+    removeFields: [],
+    resumeOnBoot: false,
+    ignoreGroupJobsLimit: false,
+    schedule: {
+      enabled: spec.enabled,
+      cronSchedule: spec.cronSchedule,
+      maxConcurrentRuns: 1,
+      skippable: false,
+      run: { mode: 'run', rescheduleDroppedTasks: false, logLevel: 'info' },
+    },
+    streamtags: [],
+    workerAffinity: false,
+    collector: {
+      type: 'script',
+      destructive: false,
+      conf: { shell: '/bin/bash', discoverScript, collectScript: 'true' },
+    },
+    input: {
+      type: 'collection',
+      sendToRoutes: false,
+      pipeline: 'devnull',
+      output: 'devnull',
+      staleChannelFlushMs: 10000,
+      metadata: [],
+      preprocess: { disabled: true },
+    },
+  };
+}
+
+/** Pull the sync settings back out of a collector's discover script. */
+export function parseSyncCollector(job: CollectorJob): {
+  lookups: string[];
+  sourceGroup: string;
+  deployDelay: number | null;
+} {
+  const script = String(job.collector?.conf?.discoverScript ?? '');
+  const delay = script.match(/--deploy-delay\s+(\d+)/)?.[1];
+  return {
+    lookups: [...script.matchAll(/--lookup\s+(\S+)/g)].map((m) => m[1]),
+    sourceGroup: script.match(/--source-group\s+(\S+)/)?.[1] ?? 'default_search',
+    deployDelay: delay ? Number(delay) : null,
+  };
+}
+
+/** The group's sync collector definition, or null if none exists yet. */
+export async function getSyncCollector(group: string): Promise<CollectorJob | null> {
+  const resp = await request('GET', `/m/${group}/lib/jobs/${SYNC_COLLECTOR_ID}`, { ok404: true });
+  if (resp.status === 404) return null;
+  const data = (await resp.json()) as Items<CollectorJob>;
+  return data.items?.[0] ?? null;
+}
+
+export async function upsertSyncCollector(group: string, job: CollectorJob, exists: boolean): Promise<void> {
+  const path = exists ? `/m/${group}/lib/jobs/${SYNC_COLLECTOR_ID}` : `/m/${group}/lib/jobs`;
+  await request(exists ? 'PATCH' : 'POST', path, {
+    body: JSON.stringify(job),
+    contentType: 'application/json',
+  });
+}
+
+export async function deleteSyncCollector(group: string): Promise<void> {
+  await request('DELETE', `/m/${group}/lib/jobs/${SYNC_COLLECTOR_ID}`);
+}
+
+// --- app settings persistence (app-scoped KV store) -----------------------
+
+export interface SavedSelection {
+  sourceGroup: string;
+  lookups: string[];
+  targetGroups: string[];
+}
+
+const SELECTION_KEY = '/kvstore/selection';
+
+export async function loadSelection(): Promise<SavedSelection | null> {
+  const resp = await request('GET', SELECTION_KEY, { ok404: true });
+  if (resp.status === 404) return null;
+  try {
+    return (await resp.json()) as SavedSelection;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveSelection(sel: SavedSelection): Promise<void> {
+  await request('PUT', SELECTION_KEY, {
+    body: JSON.stringify(sel),
+    contentType: 'application/json',
+  });
+}

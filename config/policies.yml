@@ -1,0 +1,33 @@
+# Product API access declaration. Declare Cribl product API paths your app needs to access.
+# At install time, admins see exactly which platform resources the app will use.
+
+policies:
+  # List worker groups / Edge fleets to offer as sync targets.
+  - object: '/master/groups'
+    actions: ['GET']
+  # Resolve a group's configVersion before deploying.
+  - object: '/master/groups/:id/configVersion'
+    actions: ['GET']
+  # Deploy a group's committed config.
+  - object: '/master/groups/:id/deploy'
+    actions: ['PATCH']
+  # List lookups, stage CSV uploads (PUT ?filename=), create lookup objects.
+  - object: '/m/:gid/system/lookups'
+    actions: ['GET', 'POST', 'PUT']
+  # Read/update individual lookup objects.
+  - object: '/m/:gid/system/lookups/:lid'
+    actions: ['GET', 'PATCH']
+  # Read raw lookup file content for comparison.
+  - object: '/m/:gid/system/lookups/:lid/content'
+    actions: ['GET']
+  # Manage the scheduled sync-search-lookups Script collector.
+  - object: '/m/:gid/lib/jobs'
+    actions: ['GET', 'POST']
+  - object: '/m/:gid/lib/jobs/:jid'
+    actions: ['GET', 'PATCH', 'DELETE']
+  # Detect uncommitted lookup files to scope (and recover) commits.
+  - object: '/m/:gid/version/status'
+    actions: ['GET']
+  # Commit exactly the touched lookup files.
+  - object: '/m/:gid/version/commit'
+    actions: ['POST']
