@@ -13,7 +13,7 @@ Script collector. The app keeps the script's careful semantics and drops all
 of its operational baggage: no API credentials, no env files on worker
 nodes, no Python — the sync engine is TypeScript inside the app.
 
-![Lookup Sync app: source/target selection and status matrix](images/lookup-sync-app.png)
+![Lookup Sync app: source/target selection with pack tags and filter, compare actions, and the per-group status matrix](images/lookup-sync-app.png)
 
 ## Why
 
@@ -51,6 +51,8 @@ deploy too.
 
 **Deploy** — per-group button with its own confirmation. Nothing deploys
 implicitly.
+
+![Deploy confirmation naming the group and explaining that only committed changes ship](images/deploy-confirm.png)
 
 Selections persist in the app's KV store, all destructive operations require
 explicit confirmation, and every run is logged in an activity panel.
@@ -90,6 +92,8 @@ name pipelines reference. These rows are tagged `pack` in the source list,
 the status matrix shows the rename (`pack.name.csv → name.csv`), and the
 compare step refuses selections where two pack lookups would collide on the
 same bare name.
+
+![Syncing a pack lookup: the pack tag in the source list, and the Activity log showing it synced under its bare filename with the group pending deploy](images/pack-lookup-sync.png)
 
 ## Development
 
