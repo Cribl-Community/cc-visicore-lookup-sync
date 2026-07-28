@@ -305,6 +305,15 @@ function App() {
           query exports Lake data with <Text variant="code">export to lookup</Text>, and this
           app makes the result usable by Stream pipelines.
         </Text>
+        {(lookups ?? []).some((l) => hasDottedStem(l.id)) && (
+          <Text as="p" color="tertiary" variant="body-xs-normal">
+            <Tag size="sm" color="amber">won't sync</Tag> marks lookups with a dot in their base
+            name (Search's <Text variant="code">saved-search.name.csv</Text> export pattern) —
+            Cribl's worker-group API reads <Text variant="code">x.y</Text> as pack notation, so
+            these can't be written into a group. To sync one, rename the export in your Search
+            query, e.g. <Text variant="code">| export to lookup name.csv</Text>.
+          </Text>
+        )}
       </header>
 
       {loadError && (
