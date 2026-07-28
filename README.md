@@ -50,12 +50,14 @@ deploy too.
 **Deploy** — per-group button with its own confirmation. Nothing deploys
 implicitly.
 
-**Scheduled sync** — for hands-off nightly syncs, the app provisions the same
-scheduled Script collector as the original repo (`sync-search-lookups`) into
-any target group: it bakes the selected lookups, source group, cron schedule,
-and deploy delay into the collector's discover script, creates/updates it via
-`/m/{group}/lib/jobs`, and commits scoped to `local/cribl/jobs.yml`. The
-schedule activates on the next deploy of the group.
+**Scheduled sync** — for hands-off nightly syncs, the app provisions a
+scheduled Script collector (`sync-search-lookups`) into any target group,
+with **zero worker-node setup**: the sync script is embedded in the collector
+config itself, and API credentials are stored in the group's encrypted
+secrets store and resolved on the worker at run time. The app creates/updates
+the collector and secret via the API and commits scoped to
+`local/cribl/jobs.yml` + `local/cribl/secrets.yml`. The schedule (and the
+credentials) reach the workers on the next deploy of the group.
 
 **Scheduled syncs overview** — the app scans every group for the sync
 collector and lists what each one syncs (lookups, source, cron, enabled,
@@ -73,38 +75,55 @@ explicit confirmation, and every run is logged in an activity panel.
   your leader's Apps management page.
 - At install time, admins see the app's full API surface in
   [`config/policies.yml`](config/policies.yml): lookups read/write, scoped
-  version commits, group listing/deploys, and `lib/jobs` for the scheduled
-  collector. No external domains are used (`config/proxies.yml` is empty).
+  version commits, group listing/deploys, `lib/jobs` for the scheduled
+  collector, and `system/secrets` for its credentials. No external domains
+  are used (`config/proxies.yml` is empty).
 - No credentials are configured in the app — the platform injects the signed-in
   user's auth into every API call.
 
-### Scheduled sync prerequisite (per worker node)
+### How scheduled syncs authenticate (no SSH, no worker-node files)
 
 The app's platform-injected auth covers only the API calls the app itself
 makes while open in your browser. A **scheduled** sync runs with no browser
-and no app involved: the app merely writes the collector definition into
-group config, and when the schedule fires, a worker node executes
-`sync_search_lookup.py` as a plain OS process that calls the leader's REST
-API directly — outside the app sandbox, where nothing injects auth. The
-script therefore needs its own credentials. One-time setup on each worker
-node of the target group, as the user Cribl runs as:
+involved: when the schedule fires, a worker node executes the sync script as
+a plain OS process that calls the leader's REST API directly — outside the
+app sandbox, where nothing injects auth.
 
-```bash
-cat > ~/.cribl-lookup-sync.env <<'EOF'
-export CRIBL_BASE_URL=https://main-<org>.cribl.cloud
-export CRIBL_CLIENT_ID=xxx
-export CRIBL_CLIENT_SECRET=xxx
-EOF
-chmod 600 ~/.cribl-lookup-sync.env
-```
+This app deviates from the original repo (which required SSHing into each
+worker node to drop a credentials env file and fetched the script from
+GitHub at run time) so that nothing ever has to touch a worker node — which
+also makes it work for **Cribl.Cloud-managed workers**, where SSH isn't
+possible at all:
 
-This is deliberate: collector configs are committed to the group's git
-history, so secrets must live on the node, never in the config. Runs fail
-with a clear error until the file exists. The scheduled run uses
+- **Script delivery**: `sync_search_lookup.py` is embedded in the app bundle
+  and inlined into the collector's discover script as a quoted heredoc. The
+  worker writes it to a temp file and runs it. No GitHub dependency,
+  air-gap friendly.
+- **Credentials**: entered once in the app's schedule editor and stored as a
+  `credentials`-type secret (`cc-lookup-sync-creds`) in the target group's
+  encrypted secrets store — the same KMS-backed mechanism every Cribl source
+  uses for API keys. The collector's environment variables are JavaScript
+  expressions evaluated on the worker at task launch:
+
+  ```yaml
+  envVars:
+    - name: CRIBL_CLIENT_ID
+      value: C.Secret('cc-lookup-sync-creds', 'credentials').username
+    - name: CRIBL_CLIENT_SECRET
+      value: C.Secret('cc-lookup-sync-creds', 'credentials').password
+  ```
+
+  Plaintext never appears in config or git — `secrets.yml` is committed
+  encrypted, and workers decrypt at run time.
+- **Distribution**: secrets ship with group config, so credentials (like the
+  schedule itself) take effect on the next deploy. Until a group has been
+  deployed with the secret, `C.Secret` cannot resolve on its workers.
+
+The credentials need rights to read Search knowledge and to edit, commit,
+and deploy the target group. Only remaining requirement on worker nodes:
+`python3` (present on standard Cribl workers). The scheduled run uses
 `--deploy-delay` (not `--deploy`) so the deploy-triggered worker restart
-can't kill the collector task that launched it — see the
-[original repo's README](https://github.com/VisiCore/vct-cribl-lookup-sync)
-for the full mechanics.
+can't kill the collector task that launched it.
 
 ## Known limitation: dotted lookup names
 

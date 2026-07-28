@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, NumberField, Spinner, Tag, Text, TextField } from '@capra/core';
+import { Alert, Button, Checkbox, Modal, NumberField, PasswordField, Spinner, Tag, Text, TextField } from '@capra/core';
 import { ClockOutlined, ReloadOutlined, SwapRightOutlined } from '@capra/icons';
 import {
   buildSyncCollector,
   commitFiles,
   deleteSyncCollector,
+  deleteSyncSecret,
   deployGroup,
   getRawContent,
   getSyncCollector,
+  getSyncSecret,
   hasDottedStem,
-  jobsConfigPath,
   parseSyncCollector,
+  pendingScheduleFiles,
   listGroups,
   listLookups,
   loadSelection,
@@ -18,12 +20,15 @@ import {
   pendingLookupFiles,
   saveSelection,
   SYNC_COLLECTOR_ID,
+  SYNC_SECRET_ID,
   upsertLookup,
   upsertSyncCollector,
-  WORKER_ENV_FILE,
+  upsertSyncSecret,
   type CollectorJob,
   type Group,
   type Lookup,
+  type SyncAuthMode,
+  type SyncSecretInfo,
   type SyncState,
 } from './api';
 
@@ -73,10 +78,15 @@ function App() {
 
   // Scheduled sync (Script collector) state
   const [schedules, setSchedules] = useState<Record<string, CollectorJob | null>>({});
+  const [groupSecrets, setGroupSecrets] = useState<Record<string, SyncSecretInfo | null>>({});
   const [cron, setCron] = useState('0 7 * * *');
   const [deployDelay, setDeployDelay] = useState(30);
   const [deployAfter, setDeployAfter] = useState(true);
   const [schedEnabled, setSchedEnabled] = useState(true);
+  const [authMode, setAuthMode] = useState<SyncAuthMode>('cloud');
+  const [baseUrl, setBaseUrl] = useState(() => (window.CRIBL_API_URL ?? '').replace(/\/api\/v1\/?$/, ''));
+  const [credId, setCredId] = useState('');
+  const [credSecret, setCredSecret] = useState('');
   const [confirmSchedule, setConfirmSchedule] = useState<{ gid: string; action: 'save' | 'remove' } | null>(null);
   const [schedBusy, setSchedBusy] = useState<string | null>(null);
 
@@ -148,6 +158,21 @@ function App() {
       cancelled = true;
     };
   }, [groups, schedules]);
+
+  // Check the selected groups for stored sync credentials.
+  useEffect(() => {
+    let cancelled = false;
+    const missing = [...selectedGroups].filter((gid) => !(gid in groupSecrets));
+    if (missing.length === 0) return;
+    void Promise.all(
+      missing.map(async (gid) => [gid, await getSyncSecret(gid).catch(() => null)] as const),
+    ).then((entries) => {
+      if (!cancelled) setGroupSecrets((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedGroups, groupSecrets]);
 
   const scheduleScanDone = useMemo(
     () => !!groups && groups.filter((g) => !g.isSearch).every((g) => g.id in schedules),
@@ -331,6 +356,16 @@ function App() {
     setSchedBusy(gid);
     try {
       const exists = !!schedules[gid];
+      const secretExists = !!groupSecrets[gid];
+      const credsEntered = credId.trim() !== '' && credSecret !== '';
+      if (!secretExists && !credsEntered) {
+        appendLog('error', `[${gid}] no credentials: enter a client id and secret (stored encrypted in the group's secrets store)`);
+        return;
+      }
+      if (credsEntered) {
+        await upsertSyncSecret(gid, { username: credId.trim(), password: credSecret }, secretExists);
+        setGroupSecrets((prev) => ({ ...prev, [gid]: { id: SYNC_SECRET_ID, username: credId.trim() } }));
+      }
       const job = buildSyncCollector({
         targetGroup: gid,
         sourceGroup,
@@ -339,16 +374,20 @@ function App() {
         deployDelay,
         deploy: deployAfter,
         enabled: schedEnabled,
+        baseUrl: baseUrl.trim().replace(/\/$/, ''),
+        authMode,
       });
       await upsertSyncCollector(gid, job, exists);
+      const files = await pendingScheduleFiles(gid);
       const commit = await commitFiles(
         gid,
-        [jobsConfigPath(gid)],
+        files,
         `${exists ? 'update' : 'create'} ${SYNC_COLLECTOR_ID} collector (Lookup Sync app)`,
       );
-      appendLog('success', `[${gid}] ${exists ? 'updated' : 'created'} ${SYNC_COLLECTOR_ID}, committed ${commit.slice(0, 8)} — deploy to activate`);
+      appendLog('success', `[${gid}] ${exists ? 'updated' : 'created'} ${SYNC_COLLECTOR_ID}, committed ${commit.slice(0, 8)} (${files.length} files) — deploy to activate`);
       setSchedules((prev) => ({ ...prev, [gid]: job }));
       setNeedsDeploy((prev) => new Set(prev).add(gid));
+      setCredSecret('');
     } catch (e) {
       appendLog('error', `[${gid}] schedule save failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -361,9 +400,12 @@ function App() {
     setSchedBusy(gid);
     try {
       await deleteSyncCollector(gid);
-      const commit = await commitFiles(gid, [jobsConfigPath(gid)], `remove ${SYNC_COLLECTOR_ID} collector (Lookup Sync app)`);
-      appendLog('success', `[${gid}] removed ${SYNC_COLLECTOR_ID}, committed ${commit.slice(0, 8)} — deploy to apply`);
+      await deleteSyncSecret(gid);
+      const files = await pendingScheduleFiles(gid);
+      const commit = await commitFiles(gid, files, `remove ${SYNC_COLLECTOR_ID} collector and credentials (Lookup Sync app)`);
+      appendLog('success', `[${gid}] removed ${SYNC_COLLECTOR_ID} and its credentials secret, committed ${commit.slice(0, 8)} — deploy to apply`);
       setSchedules((prev) => ({ ...prev, [gid]: null }));
+      setGroupSecrets((prev) => ({ ...prev, [gid]: null }));
       setNeedsDeploy((prev) => new Set(prev).add(gid));
     } catch (e) {
       appendLog('error', `[${gid}] schedule remove failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -573,21 +615,47 @@ function App() {
             </span>
           </div>
           <Text as="p" color="secondary">
-            For hands-off syncs, each target group can run the original{' '}
-            <Text variant="code">sync_search_lookup.py</Text> on a schedule via a Script
-            collector named <Text variant="code">{SYNC_COLLECTOR_ID}</Text> — the same setup as
-            the GitHub repo, provisioned from here. The collector bakes in the currently
-            selected lookups ({selectedLookups.size ? [...selectedLookups].join(', ') : 'none selected'})
-            and source group ({sourceGroup}).
+            For hands-off syncs, each target group runs the sync on a schedule via a Script
+            collector named <Text variant="code">{SYNC_COLLECTOR_ID}</Text>. The sync script is
+            embedded in the collector config and API credentials live in the group's encrypted
+            secrets store — no SSH, no files on worker nodes, works with Cribl.Cloud-managed
+            workers. The collector bakes in the currently selected lookups
+            ({selectedLookups.size ? [...selectedLookups].join(', ') : 'none selected'}) and
+            source group ({sourceGroup}). Only requirement on workers: <Text variant="code">python3</Text>.
           </Text>
-          <Alert appearance="info" layout="inline" title="One-time prerequisite per worker node">
-            The scheduled script authenticates with API credentials from{' '}
-            <Text variant="code">{WORKER_ENV_FILE}</Text> on each worker node (CRIBL_BASE_URL,
-            CRIBL_CLIENT_ID, CRIBL_CLIENT_SECRET; chmod 600). The app cannot place this file for
-            you — see the vct-cribl-lookup-sync README. Keep secrets out of the collector config;
-            it is committed to the group's git history.
-          </Alert>
           <div className="schedule-form">
+            <div className="schedule-cred-fields">
+              <div className="source-picker">
+                <Text color="secondary">Auth</Text>
+                <select
+                  className="group-select"
+                  value={authMode}
+                  onChange={(e) => setAuthMode(e.target.value as SyncAuthMode)}
+                >
+                  <option value="cloud">Cloud API credentials</option>
+                  <option value="local">Local username/password</option>
+                </select>
+              </div>
+              <TextField
+                label="Leader URL"
+                value={baseUrl}
+                onChange={setBaseUrl}
+                placeholder="https://main-<org>.cribl.cloud"
+                helperText="Workspace/leader URL the worker-side script calls"
+              />
+              <TextField
+                label={authMode === 'cloud' ? 'Client ID' : 'Username'}
+                value={credId}
+                onChange={setCredId}
+                helperText={`Stored encrypted as group secret '${SYNC_SECRET_ID}'`}
+              />
+              <PasswordField
+                label={authMode === 'cloud' ? 'Client secret' : 'Password'}
+                value={credSecret}
+                onChange={setCredSecret}
+                helperText="Leave blank to keep a group's already-stored credentials"
+              />
+            </div>
             <TextField
               label="Cron schedule"
               value={cron}
@@ -610,10 +678,16 @@ function App() {
               Schedule enabled
             </Checkbox>
           </div>
+          <Text color="tertiary" variant="body-xs-normal">
+            Credentials need rights to read Search knowledge and edit/commit/deploy the target
+            group. They're delivered to the script at run time via C.Secret() in the collector's
+            environment variables — never in plain text in config or git.
+          </Text>
           <ul className="schedule-list">
             {[...selectedGroups].map((gid) => {
               const existing = schedules[gid];
-              const loaded = gid in schedules;
+              const loaded = gid in schedules && gid in groupSecrets;
+              const hasCreds = !!groupSecrets[gid] || (credId.trim() !== '' && credSecret !== '');
               return (
                 <li key={gid} className="schedule-row">
                   <span className="pick-label">
@@ -627,12 +701,19 @@ function App() {
                     ) : (
                       <Tag size="sm" color="default">no schedule</Tag>
                     )}
+                    {loaded && (
+                      groupSecrets[gid] ? (
+                        <Tag size="sm" color="criblTeal">{`credentials stored${groupSecrets[gid]?.username ? ` · ${groupSecrets[gid]?.username}` : ''}`}</Tag>
+                      ) : (
+                        <Tag size="sm" color="amber">no credentials yet</Tag>
+                      )
+                    )}
                   </span>
                   <span className="schedule-row-actions">
                     <Button
                       size="sm"
                       variant="secondary"
-                      disabled={!loaded || selectedLookups.size === 0 || !cronValid || schedBusy !== null}
+                      disabled={!loaded || selectedLookups.size === 0 || !cronValid || !baseUrl.trim() || !hasCreds || schedBusy !== null}
                       pending={schedBusy === gid}
                       onClick={() => setConfirmSchedule({ gid, action: 'save' })}
                     >
@@ -804,9 +885,10 @@ function App() {
       >
         {confirmSchedule?.action === 'remove' ? (
           <Text as="p">
-            This deletes the <Text variant="code">{SYNC_COLLECTOR_ID}</Text> collector from{' '}
+            This deletes the <Text variant="code">{SYNC_COLLECTOR_ID}</Text> collector and its{' '}
+            <Text variant="code">{SYNC_SECRET_ID}</Text> credentials secret from{' '}
             <Text variant="body-md-semibold">{confirmSchedule.gid}</Text> and commits the change
-            (scoped to the collector config only). Scheduled syncs stop after the next deploy.
+            (scoped to those config files only). Scheduled syncs stop after the next deploy.
             This cannot be undone from this app.
           </Text>
         ) : (
@@ -814,21 +896,27 @@ function App() {
             <Text as="p">
               This {schedules[confirmSchedule?.gid ?? ''] ? 'overwrites the existing' : 'creates a'}{' '}
               <Text variant="code">{SYNC_COLLECTOR_ID}</Text> Script collector in{' '}
-              <Text variant="body-md-semibold">{confirmSchedule?.gid}</Text> and commits it
-              (scoped to the collector config only). The schedule takes effect after the next deploy.
+              <Text variant="body-md-semibold">{confirmSchedule?.gid}</Text>
+              {credId.trim() && credSecret
+                ? <> , stores the entered credentials encrypted as group secret <Text variant="code">{SYNC_SECRET_ID}</Text>,</>
+                : ' (keeping the group’s stored credentials)'}{' '}
+              and commits — scoped to those config files only. The schedule takes effect after
+              the next deploy, which also distributes the credentials to the workers.
             </Text>
             <ul className="confirm-spec">
               <li><Text color="secondary">Lookups:</Text> <Text variant="code">{[...selectedLookups].join(', ')}</Text></li>
               <li><Text color="secondary">Source group:</Text> <Text variant="code">{sourceGroup}</Text></li>
               <li><Text color="secondary">Schedule:</Text> <Text variant="code">{cron.trim()}</Text> ({schedEnabled ? 'enabled' : 'disabled'})</li>
+              <li><Text color="secondary">Leader URL:</Text> <Text variant="code">{baseUrl.trim()}</Text></li>
+              <li><Text color="secondary">Auth:</Text> {authMode === 'cloud' ? 'Cloud API credentials' : 'Local username/password'}</li>
               <li>
                 <Text color="secondary">After sync:</Text>{' '}
                 {deployAfter ? `commit + detached deploy ${deployDelay}s later` : 'commit only (deploy manually)'}
               </li>
             </ul>
             <Text as="p" color="secondary">
-              Requires <Text variant="code">{WORKER_ENV_FILE}</Text> on the worker nodes — runs
-              will fail with a clear error until it exists.
+              No worker-node setup is needed — the sync script ships inside the collector config
+              and credentials are resolved on the worker via C.Secret().
             </Text>
           </div>
         )}

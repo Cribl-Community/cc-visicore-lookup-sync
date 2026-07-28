@@ -142,6 +142,16 @@
   gap: token('spacing.lg');
 }
 
+.schedule-cred-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: token('spacing.lg');
+  width: 100%;
+  padding-bottom: token('spacing.sm');
+  border-bottom: token('border.default');
+}
+
 .schedule-list {
   list-style: none;
   display: flex;

@@ -173,17 +173,21 @@ export async function deployGroup(group: string): Promise<string> {
 
 // --- scheduled sync via Script collector ----------------------------------
 //
-// Mirrors collector-sync-search-lookups.json from the original repo: a
-// scheduled Script collector on the target group runs sync_search_lookup.py
-// on a worker node. The app manages the collector definition; the one thing
-// it cannot do is place the credentials env file on the worker nodes — that
-// remains a documented manual step.
+// Deviates from collector-sync-search-lookups.json in the original repo to
+// remove every worker-node prerequisite (no SSH, no env file, no GitHub
+// download — works on Cribl.Cloud-managed workers):
+//   - sync_search_lookup.py is embedded in this app bundle and inlined into
+//     the collector's discover script via a quoted heredoc;
+//   - API credentials live in the group's encrypted secrets store and reach
+//     the script through the collector's envVars, whose values are JS
+//     expressions evaluated on the worker: C.Secret(id, 'credentials').
+// Secrets are distributed with group config, so a schedule (and its
+// credentials) take effect after commit + deploy — same lifecycle as before.
+
+import syncScriptSource from './embedded/sync_search_lookup.py?raw';
 
 export const SYNC_COLLECTOR_ID = 'sync-search-lookups';
-export const WORKER_ENV_FILE = '~/.cribl-lookup-sync.env';
-
-const SCRIPT_URL =
-  'https://raw.githubusercontent.com/VisiCore/vct-cribl-lookup-sync/main/sync_search_lookup.py';
+export const SYNC_SECRET_ID = 'cc-lookup-sync-creds';
 
 export interface CollectorJob {
   id: string;
@@ -193,6 +197,8 @@ export interface CollectorJob {
   [key: string]: unknown;
 }
 
+export type SyncAuthMode = 'cloud' | 'local';
+
 export interface ScheduleSpec {
   targetGroup: string;
   sourceGroup: string;
@@ -201,10 +207,16 @@ export interface ScheduleSpec {
   deployDelay: number;
   deploy: boolean;
   enabled: boolean;
+  /** Leader/workspace URL the worker-side script talks to. */
+  baseUrl: string;
+  /** cloud = API client id/secret via login.cribl.cloud; local = leader username/password. */
+  authMode: SyncAuthMode;
 }
 
 /** The jobs.yml config path a collector definition lives in — used to scope the commit. */
 export const jobsConfigPath = (group: string) => `groups/${group}/local/cribl/jobs.yml`;
+/** Where the group's secrets store lives in config — committed encrypted. */
+export const secretsConfigPath = (group: string) => `groups/${group}/local/cribl/secrets.yml`;
 
 export function buildSyncCollector(spec: ScheduleSpec): CollectorJob {
   const flags = [
@@ -215,21 +227,38 @@ export function buildSyncCollector(spec: ScheduleSpec): CollectorJob {
     // very worker running the collector task before it can report success.
     ...(spec.deploy ? [`--deploy-delay ${spec.deployDelay}`] : []),
   ].join(' ');
+  // The embedded script is written to a temp file at run time (a quoted
+  // heredoc, so the worker shell expands nothing inside it) — the file must
+  // exist on disk because --deploy-delay re-executes it from a detached child.
   const discoverScript = [
     'set -e',
-    'ENV_FILE=$HOME/.cribl-lookup-sync.env',
-    'if [ ! -f "$ENV_FILE" ]; then echo "ERROR: $ENV_FILE not found on worker; see vct-cribl-lookup-sync README"; exit 1; fi',
-    '. "$ENV_FILE"',
-    `curl -fsSL ${SCRIPT_URL} -o /tmp/sync_search_lookup.py`,
-    `python3 /tmp/sync_search_lookup.py ${flags} 2>&1`,
+    'command -v python3 >/dev/null || { echo "ERROR: python3 not found on worker node"; exit 1; }',
+    "cat > /tmp/cc-lookup-sync.py <<'CCPYEOF'",
+    syncScriptSource.trimEnd(),
+    'CCPYEOF',
+    `python3 /tmp/cc-lookup-sync.py ${flags} 2>&1`,
     '',
   ].join('\n');
+  const secretField = (field: 'username' | 'password') =>
+    `C.Secret('${SYNC_SECRET_ID}', 'credentials').${field}`;
+  const envVars =
+    spec.authMode === 'cloud'
+      ? [
+          { name: 'CRIBL_BASE_URL', value: `'${spec.baseUrl}'` },
+          { name: 'CRIBL_CLIENT_ID', value: secretField('username') },
+          { name: 'CRIBL_CLIENT_SECRET', value: secretField('password') },
+        ]
+      : [
+          { name: 'CRIBL_BASE_URL', value: `'${spec.baseUrl}'` },
+          { name: 'CRIBL_USERNAME', value: secretField('username') },
+          { name: 'CRIBL_PASSWORD', value: secretField('password') },
+        ];
   return {
     id: SYNC_COLLECTOR_ID,
     description:
       `Scheduled sync of Cribl Search lookups (${spec.lookups.join(', ')}) from ` +
       `${spec.sourceGroup} into ${spec.targetGroup}. Managed by the Lookup Sync app. ` +
-      `Creds in ${WORKER_ENV_FILE} on the worker node.`,
+      `Script embedded in this config; credentials from the '${SYNC_SECRET_ID}' group secret.`,
     type: 'collection',
     ttl: '4h',
     removeFields: [],
@@ -247,7 +276,7 @@ export function buildSyncCollector(spec: ScheduleSpec): CollectorJob {
     collector: {
       type: 'script',
       destructive: false,
-      conf: { shell: '/bin/bash', discoverScript, collectScript: 'true' },
+      conf: { shell: '/bin/bash', discoverScript, collectScript: 'true', envVars },
     },
     input: {
       type: 'collection',
@@ -274,6 +303,50 @@ export function parseSyncCollector(job: CollectorJob): {
     sourceGroup: script.match(/--source-group\s+(\S+)/)?.[1] ?? 'default_search',
     deployDelay: delay ? Number(delay) : null,
   };
+}
+
+// --- credentials secret (encrypted, per-group, distributed on deploy) ------
+
+export interface SyncSecretInfo {
+  id: string;
+  /** Client id (cloud) or username (local). The secret value is never returned. */
+  username?: string;
+}
+
+/** Metadata of the group's sync credentials secret, or null if absent. */
+export async function getSyncSecret(group: string): Promise<SyncSecretInfo | null> {
+  const resp = await request('GET', `/m/${group}/system/secrets/${SYNC_SECRET_ID}`, { ok404: true });
+  if (resp.status === 404) return null;
+  const data = (await resp.json()) as Items<SyncSecretInfo>;
+  return data.items?.[0] ?? null;
+}
+
+export async function upsertSyncSecret(
+  group: string,
+  creds: { username: string; password: string },
+  exists: boolean,
+): Promise<void> {
+  const body = JSON.stringify({
+    id: SYNC_SECRET_ID,
+    secretType: 'credentials',
+    username: creds.username,
+    password: creds.password,
+    description: 'API credentials for the sync-search-lookups collector (Lookup Sync app)',
+  });
+  const path = exists ? `/m/${group}/system/secrets/${SYNC_SECRET_ID}` : `/m/${group}/system/secrets`;
+  await request(exists ? 'PATCH' : 'POST', path, { body, contentType: 'application/json' });
+}
+
+export async function deleteSyncSecret(group: string): Promise<void> {
+  const resp = await request('DELETE', `/m/${group}/system/secrets/${SYNC_SECRET_ID}`, { ok404: true });
+  void resp;
+}
+
+/** Of the schedule-related config paths, those with uncommitted changes. */
+export async function pendingScheduleFiles(group: string): Promise<string[]> {
+  const data = await getJson<Items<{ files?: { path: string }[] }>>(`/m/${group}/version/status`);
+  const pending = new Set((data.items?.[0]?.files ?? []).map((f) => f.path));
+  return [jobsConfigPath(group), secretsConfigPath(group)].filter((p) => pending.has(p));
 }
 
 /** The group's sync collector definition, or null if none exists yet. */
