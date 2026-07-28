@@ -50,14 +50,28 @@ deploy too.
 **Deploy** — per-group button with its own confirmation. Nothing deploys
 implicitly.
 
-**Scheduled sync** — for hands-off nightly syncs, the app provisions a
-scheduled Script collector (`sync-search-lookups`) into any target group,
-with **zero worker-node setup**: the sync script is embedded in the collector
-config itself, and API credentials are stored in the group's encrypted
-secrets store and resolved on the worker at run time. The app creates/updates
-the collector and secret via the API and commits scoped to
-`local/cribl/jobs.yml` + `local/cribl/secrets.yml`. The schedule (and the
-credentials) reach the workers on the next deploy of the group.
+**Scheduled sync** — two modes, matching how much unattendedness you need:
+
+| | In-app schedule | Worker collector |
+|---|---|---|
+| Credentials | **None** — your signed-in session | API credentials, stored encrypted in the group's secrets store |
+| Runs | While anyone has the app open; missed windows catch up on open | Fully unattended, on the leader's scheduler |
+| Worker-node setup | None | None (script embedded in config; only needs `python3`) |
+| Deploy after sync | Immediate | Detached, delayed (worker-restart safe) |
+
+The **in-app schedule** runs the sync inside the app itself on the platform's
+injected auth — no secrets anywhere. Since syncs are idempotent
+(byte-compared, no-op when unchanged), the "runs while open" semantic is
+useful for teams that keep dashboards open, and harmless when it overlaps.
+
+The **worker collector** provisions a scheduled Script collector
+(`sync-search-lookups`) into the target group with **zero worker-node
+setup**: the sync script is embedded in the collector config itself, and API
+credentials are stored in the group's encrypted secrets store and resolved on
+the worker at run time. The app creates/updates the collector and secret via
+the API and commits scoped to `local/cribl/jobs.yml` +
+`local/cribl/secrets.yml`. The schedule (and the credentials) reach the
+workers on the next deploy of the group.
 
 **Scheduled syncs overview** — the app scans every group for the sync
 collector and lists what each one syncs (lookups, source, cron, enabled,
@@ -84,10 +98,18 @@ explicit confirmation, and every run is logged in an activity panel.
 ### How scheduled syncs authenticate (no SSH, no worker-node files)
 
 The app's platform-injected auth covers only the API calls the app itself
-makes while open in your browser. A **scheduled** sync runs with no browser
-involved: when the schedule fires, a worker node executes the sync script as
-a plain OS process that calls the leader's REST API directly — outside the
-app sandbox, where nothing injects auth.
+makes while open in your browser — that is what the credential-less
+**in-app schedule** uses, and why it stops when the app closes. (This mirrors
+how other Cribl App Platform apps handle background behavior: apps have no
+server side, so e.g. cc-visicore-vitals provisions native Cribl Notifications
+for its alerting rather than running anything itself. No native Cribl
+primitive exists for cross-group lookup sync, so true unattended syncs need
+the collector below.)
+
+A **worker collector** sync runs with no browser involved: when the schedule
+fires, a worker node executes the sync script as a plain OS process that
+calls the leader's REST API directly — outside the app sandbox, where
+nothing injects auth.
 
 This app deviates from the original repo (which required SSHing into each
 worker node to drop a credentials env file and fetched the script from

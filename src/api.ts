@@ -369,6 +369,110 @@ export async function deleteSyncCollector(group: string): Promise<void> {
   await request('DELETE', `/m/${group}/lib/jobs/${SYNC_COLLECTOR_ID}`);
 }
 
+// --- in-app (browser) scheduled sync ---------------------------------------
+//
+// Credential-less alternative to the worker collector: the sync runs inside
+// the app on the signed-in user's platform-injected auth. Trade-off: it only
+// runs while someone has the app open. Runs are idempotent (byte-compare,
+// no-op when unchanged) and missed windows are caught up when the app opens.
+
+export interface HeadlessSyncResult {
+  lines: { kind: 'info' | 'success' | 'error'; text: string }[];
+  committedGroups: string[];
+  deployedGroups: string[];
+}
+
+/** One full sync pass — same semantics as the interactive Compare + Sync + Deploy. */
+export async function runHeadlessSync(opts: {
+  sourceGroup: string;
+  lookups: string[];
+  targetGroups: string[];
+  deploy: boolean;
+}): Promise<HeadlessSyncResult> {
+  const lines: HeadlessSyncResult['lines'] = [];
+  const committedGroups: string[] = [];
+  const deployedGroups: string[] = [];
+
+  const sourceContent: Record<string, string> = {};
+  for (const id of opts.lookups) {
+    try {
+      if (!(await lookupExists(opts.sourceGroup, id))) {
+        lines.push({ kind: 'error', text: `${id} not found in ${opts.sourceGroup} — skipped` });
+        continue;
+      }
+      const content = await getRawContent(opts.sourceGroup, id);
+      if (content === null) lines.push({ kind: 'error', text: `${id} has no content in ${opts.sourceGroup} — skipped` });
+      else sourceContent[id] = content;
+    } catch (e) {
+      lines.push({ kind: 'error', text: `${id}: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+
+  for (const gid of opts.targetGroups) {
+    try {
+      let changed = 0;
+      for (const [id, content] of Object.entries(sourceContent)) {
+        try {
+          const target = (await lookupExists(gid, id)) ? await getRawContent(gid, id) : null;
+          if (target === content) continue;
+          await upsertLookup(gid, id, content);
+          changed++;
+          lines.push({ kind: 'info', text: `[${gid}] synced ${id} (${content.length} bytes)` });
+        } catch (e) {
+          lines.push({ kind: 'error', text: `[${gid}] ${id}: ${e instanceof Error ? e.message : String(e)}` });
+        }
+      }
+      const files = await pendingLookupFiles(gid, Object.keys(sourceContent));
+      if (files.length === 0) {
+        if (changed === 0) lines.push({ kind: 'info', text: `[${gid}] already up to date` });
+        continue;
+      }
+      const names = [...new Set(files.map((p) => p.split('/').pop()))].sort();
+      const commit = await commitFiles(gid, files, `scheduled sync from ${opts.sourceGroup}: ${names.join(', ')} (Lookup Sync app, browser schedule)`);
+      committedGroups.push(gid);
+      lines.push({ kind: 'success', text: `[${gid}] committed ${commit.slice(0, 8)} (${files.length} files)` });
+      if (opts.deploy) {
+        const version = await deployGroup(gid);
+        deployedGroups.push(gid);
+        lines.push({ kind: 'success', text: `[${gid}] deployed ${version.slice(0, 12)}` });
+      }
+    } catch (e) {
+      lines.push({ kind: 'error', text: `[${gid}] sync failed: ${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  return { lines, committedGroups, deployedGroups };
+}
+
+export interface BrowserSchedule {
+  enabled: boolean;
+  cron: string;
+  deploy: boolean;
+  sourceGroup: string;
+  lookups: string[];
+  targetGroups: string[];
+  /** Epoch ms of the last claimed run occurrence (shared across tabs via KV). */
+  lastRun: number | null;
+}
+
+const BROWSER_SCHEDULE_KEY = '/kvstore/browser-schedule';
+
+export async function loadBrowserSchedule(): Promise<BrowserSchedule | null> {
+  const resp = await request('GET', BROWSER_SCHEDULE_KEY, { ok404: true });
+  if (resp.status === 404) return null;
+  try {
+    return (await resp.json()) as BrowserSchedule;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveBrowserSchedule(sched: BrowserSchedule): Promise<void> {
+  await request('PUT', BROWSER_SCHEDULE_KEY, {
+    body: JSON.stringify(sched),
+    contentType: 'application/json',
+  });
+}
+
 // --- app settings persistence (app-scoped KV store) -----------------------
 
 export interface SavedSelection {

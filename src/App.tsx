@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Checkbox, Modal, NumberField, PasswordField, Spinner, Tag, Text, TextField } from '@capra/core';
 import { ClockOutlined, ReloadOutlined, SwapRightOutlined } from '@capra/icons';
 import {
@@ -11,8 +11,11 @@ import {
   getSyncCollector,
   getSyncSecret,
   hasDottedStem,
+  loadBrowserSchedule,
   parseSyncCollector,
   pendingScheduleFiles,
+  runHeadlessSync,
+  saveBrowserSchedule,
   listGroups,
   listLookups,
   loadSelection,
@@ -24,6 +27,7 @@ import {
   upsertLookup,
   upsertSyncCollector,
   upsertSyncSecret,
+  type BrowserSchedule,
   type CollectorJob,
   type Group,
   type Lookup,
@@ -31,6 +35,7 @@ import {
   type SyncSecretInfo,
   type SyncState,
 } from './api';
+import { lastDue, nextDue } from './cron';
 
 const DEFAULT_SOURCE = 'default_search';
 
@@ -90,6 +95,12 @@ function App() {
   const [confirmSchedule, setConfirmSchedule] = useState<{ gid: string; action: 'save' | 'remove' } | null>(null);
   const [schedBusy, setSchedBusy] = useState<string | null>(null);
 
+  // In-app (browser) schedule — credential-less, runs while the app is open.
+  const [browserSched, setBrowserSched] = useState<BrowserSchedule | null>(null);
+  const [browserRunning, setBrowserRunning] = useState(false);
+  const [confirmBrowserSchedule, setConfirmBrowserSchedule] = useState(false);
+  const browserRunningRef = useRef(false);
+
   const appendLog = useCallback((kind: LogLine['kind'], text: string) => {
     setLog((prev) => [...prev, { kind, text }]);
   }, []);
@@ -104,9 +115,14 @@ function App() {
     let cancelled = false;
     (async () => {
       try {
-        const [allGroups, saved] = await Promise.all([listGroups(), loadSelection().catch(() => null)]);
+        const [allGroups, saved, bs] = await Promise.all([
+          listGroups(),
+          loadSelection().catch(() => null),
+          loadBrowserSchedule().catch(() => null),
+        ]);
         if (cancelled) return;
         setGroups(allGroups);
+        if (bs) setBrowserSched(bs);
         if (saved) {
           if (allGroups.some((g) => g.id === saved.sourceGroup)) setSourceGroup(saved.sourceGroup);
           setSelectedLookups(new Set(saved.lookups));
@@ -350,6 +366,80 @@ function App() {
   };
 
   const cronValid = /^\S+\s+\S+\s+\S+\s+\S+\s+\S+$/.test(cron.trim());
+
+  // Browser-schedule loop: while armed and the app is open, run when a cron
+  // occurrence is due. lastRun is claimed in the KV store BEFORE running so
+  // another open tab won't double-run; missed windows (app closed) surface as
+  // a due occurrence the moment the app reopens. Syncs are idempotent, so an
+  // occasional race costs nothing but a no-op.
+  useEffect(() => {
+    if (!browserSched?.enabled) return;
+    const tick = async () => {
+      if (browserRunningRef.current) return;
+      const due = lastDue(browserSched.cron, Date.now());
+      if (due === null || (browserSched.lastRun !== null && due <= browserSched.lastRun)) return;
+      browserRunningRef.current = true;
+      setBrowserRunning(true);
+      try {
+        const claimed = { ...browserSched, lastRun: due };
+        await saveBrowserSchedule(claimed);
+        setBrowserSched(claimed);
+        appendLog('info', `in-app schedule: sync due ${new Date(due).toLocaleString()} — running with your session`);
+        const res = await runHeadlessSync({
+          sourceGroup: browserSched.sourceGroup,
+          lookups: browserSched.lookups,
+          targetGroups: browserSched.targetGroups,
+          deploy: browserSched.deploy,
+        });
+        for (const l of res.lines) appendLog(l.kind, l.text);
+        const undeployed = res.committedGroups.filter((g) => !res.deployedGroups.includes(g));
+        if (undeployed.length > 0) {
+          setNeedsDeploy((prev) => new Set([...prev, ...undeployed]));
+        }
+        if (res.committedGroups.length === 0) appendLog('info', 'in-app schedule: everything already in sync');
+      } catch (e) {
+        appendLog('error', `in-app schedule run failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        browserRunningRef.current = false;
+        setBrowserRunning(false);
+      }
+    };
+    void tick();
+    const handle = setInterval(() => void tick(), 30_000);
+    return () => clearInterval(handle);
+  }, [browserSched, appendLog]);
+
+  const armBrowserSchedule = async () => {
+    setConfirmBrowserSchedule(false);
+    const sched: BrowserSchedule = {
+      enabled: true,
+      cron: cron.trim(),
+      deploy: deployAfter,
+      sourceGroup,
+      lookups: [...selectedLookups],
+      targetGroups: [...selectedGroups],
+      lastRun: Date.now(), // start with the NEXT occurrence; use Sync for an immediate run
+    };
+    try {
+      await saveBrowserSchedule(sched);
+      setBrowserSched(sched);
+      appendLog('success', `in-app schedule enabled: ${sched.cron} — ${sched.lookups.join(', ')} → ${sched.targetGroups.join(', ')}`);
+    } catch (e) {
+      appendLog('error', `failed to save in-app schedule: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const disarmBrowserSchedule = async () => {
+    if (!browserSched) return;
+    const sched = { ...browserSched, enabled: false };
+    try {
+      await saveBrowserSchedule(sched);
+      setBrowserSched(sched);
+      appendLog('info', 'in-app schedule disabled');
+    } catch (e) {
+      appendLog('error', `failed to disable in-app schedule: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   const runSaveSchedule = async (gid: string) => {
     setConfirmSchedule(null);
@@ -623,6 +713,52 @@ function App() {
             ({selectedLookups.size ? [...selectedLookups].join(', ') : 'none selected'}) and
             source group ({sourceGroup}). Only requirement on workers: <Text variant="code">python3</Text>.
           </Text>
+          <div className="browser-sched">
+            <div className="panel-header">
+              <span className="pick-label">
+                <Text variant="body-sm-semibold">In-app schedule</Text>
+                <Tag size="sm" color="criblTeal">no credentials — uses your session</Tag>
+                {browserRunning && <Spinner size="sm" />}
+              </span>
+              {browserSched?.enabled ? (
+                <Button size="sm" variant="secondary" onClick={() => void disarmBrowserSchedule()}>
+                  Disable
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={selectedLookups.size === 0 || selectedGroups.size === 0 || !cronValid}
+                  onClick={() => setConfirmBrowserSchedule(true)}
+                >
+                  Enable
+                </Button>
+              )}
+            </div>
+            {browserSched?.enabled ? (
+              <Text color="secondary">
+                Runs <Text variant="code">{browserSched.cron}</Text> while this app is open:{' '}
+                {browserSched.lookups.join(', ')} from {browserSched.sourceGroup} into{' '}
+                {browserSched.targetGroups.join(', ')}
+                {browserSched.deploy ? ', then deploys' : ' (commit only)'}. Last run:{' '}
+                {browserSched.lastRun ? new Date(browserSched.lastRun).toLocaleString() : 'never'}; next:{' '}
+                {(() => {
+                  const n = nextDue(browserSched.cron, Date.now());
+                  return n ? new Date(n).toLocaleString() : 'unknown';
+                })()}. Missed windows run as soon as the app is reopened.
+              </Text>
+            ) : (
+              <Text color="secondary">
+                Credential-less scheduling: the sync runs inside this app with your signed-in
+                session at the cron below — no secrets, no collector, nothing on workers. It only
+                runs while someone has the app open (missed windows are caught up on open). For
+                fully unattended syncs, use the worker collector below instead.
+              </Text>
+            )}
+          </div>
+          <div className="panel-header">
+            <Text variant="body-sm-semibold">Worker collector schedule (unattended)</Text>
+          </div>
           <div className="schedule-form">
             <div className="schedule-cred-fields">
               <div className="source-picker">
@@ -920,6 +1056,35 @@ function App() {
             </Text>
           </div>
         )}
+      </Modal>
+
+      <Modal
+        isOpen={confirmBrowserSchedule}
+        title="Enable in-app scheduled sync?"
+        confirmButtonText="Enable"
+        cancelButtonText="Cancel"
+        onConfirm={() => void armBrowserSchedule()}
+        onClose={() => setConfirmBrowserSchedule(false)}
+      >
+        <div className="confirm-body">
+          <Text as="p">
+            While this app is open, it will automatically sync, commit
+            {deployAfter ? ', and deploy' : ''} on the schedule below using your signed-in
+            session — no further confirmation per run. Runs are logged in the Activity panel,
+            commits stay scoped to the touched lookup files, and unchanged lookups are no-ops.
+          </Text>
+          <ul className="confirm-spec">
+            <li><Text color="secondary">Lookups:</Text> <Text variant="code">{[...selectedLookups].join(', ')}</Text></li>
+            <li><Text color="secondary">Source group:</Text> <Text variant="code">{sourceGroup}</Text></li>
+            <li><Text color="secondary">Targets:</Text> <Text variant="code">{[...selectedGroups].join(', ')}</Text></li>
+            <li><Text color="secondary">Schedule:</Text> <Text variant="code">{cron.trim()}</Text> (while app is open; catch-up on reopen)</li>
+            <li><Text color="secondary">After sync:</Text> {deployAfter ? 'deploy immediately' : 'commit only — deploy manually'}</li>
+          </ul>
+          <Text as="p" color="secondary">
+            Nothing runs while the app is closed. The schedule is stored in the app's KV store
+            and shared across tabs; the first run happens at the next cron occurrence.
+          </Text>
+        </div>
       </Modal>
 
       <Modal

@@ -142,6 +142,16 @@
   gap: token('spacing.lg');
 }
 
+.browser-sched {
+  display: flex;
+  flex-direction: column;
+  gap: token('spacing.sm');
+  padding: token('spacing.md');
+  border: token('border.default');
+  border-radius: token('radius.md');
+  background-color: token('color.background.accent.subtle');
+}
+
 .schedule-cred-fields {
   display: flex;
   flex-wrap: wrap;
