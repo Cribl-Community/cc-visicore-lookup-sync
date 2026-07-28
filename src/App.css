@@ -31,8 +31,15 @@
 }
 
 .arrow-cell {
+  align-self: center;
   display: flex;
   align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: token('border.default');
+  border-radius: token('radius.full');
+  background-color: token('color.background.surface');
   color: token('color.foreground.subtle');
 }
 
@@ -42,8 +49,8 @@
   gap: token('spacing.md');
   padding: token('spacing.lg');
   border: token('border.default');
-  border-radius: token('radius.md');
-  background-color: token('color.background.neutral.default');
+  border-radius: token('radius.lg');
+  background-color: token('color.background.surface');
 }
 
 .panel-header {
@@ -51,6 +58,13 @@
   align-items: center;
   justify-content: space-between;
   gap: token('spacing.md');
+  min-height: 28px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: token('spacing.sm');
 }
 
 .source-picker {
@@ -65,7 +79,7 @@
   padding: token('spacing.xs') token('spacing.sm');
   border: token('border.default');
   border-radius: token('radius.md');
-  background-color: token('color.background.neutral.default');
+  background-color: token('color.background.surface');
 }
 
 .panel-loading {
@@ -78,15 +92,57 @@
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: token('spacing.sm');
-  max-height: 320px;
+  max-height: 340px;
   overflow-y: auto;
 }
 
-.pick-label {
-  display: inline-flex;
-  align-items: baseline;
+.pick-row {
+  display: flex;
+  align-items: center;
   gap: token('spacing.sm');
+  padding: token('spacing.sm');
+  border-radius: token('radius.md');
+  cursor: pointer;
+}
+
+.pick-row:hover {
+  background-color: token('color.background.neutral.hover');
+}
+
+.pick-row.selected {
+  background-color: token('color.background.neutral.selected');
+}
+
+/* Clicks are handled by the row so the whole row is a hit target; the
+   checkbox itself stays keyboard-accessible. */
+.pick-check {
+  display: inline-flex;
+  pointer-events: none;
+}
+
+.row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.row-meta {
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: token('spacing.sm');
+}
+
+.list-empty {
+  padding: token('spacing.md') token('spacing.sm');
 }
 
 .actions-row {
@@ -104,12 +160,34 @@
   width: 100%;
 }
 
-.status-table th,
+.status-table th {
+  text-align: left;
+  padding: token('spacing.sm') token('spacing.md');
+  border-bottom: 1px solid token('color.border.neutral.default');
+  white-space: nowrap;
+}
+
+.status-table .th-label {
+  font-size: token('core.fontSize.xxs');
+  font-weight: token('core.fontWeight.semibold');
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: token('color.foreground.subtle');
+}
+
 .status-table td {
   text-align: left;
   padding: token('spacing.sm') token('spacing.md');
-  border-bottom: token('border.default');
+  border-bottom: 1px solid token('color.border.neutral.subtle');
   white-space: nowrap;
+}
+
+.status-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.status-table tbody tr:hover {
+  background-color: token('color.background.neutral.hover');
 }
 
 .deploy-row {
@@ -122,17 +200,46 @@
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: token('spacing.xs');
   max-height: 240px;
   overflow-y: auto;
+}
+
+.log-list li {
+  display: flex;
+  align-items: baseline;
+  gap: token('spacing.sm');
+  padding: 2px token('spacing.sm');
+  border-radius: token('radius.md');
+}
+
+.log-list li::before {
+  content: '';
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: token('radius.full');
+  background-color: token('color.background.neutral.indicator');
+  transform: translateY(-1px);
+}
+
+.log-list li:hover {
+  background-color: token('color.background.neutral.hover');
 }
 
 .log-error {
   color: token('color.foreground.danger.default');
 }
 
+.log-error::before {
+  background-color: token('color.background.danger.indicator');
+}
+
 .log-success {
   color: token('color.foreground.success.default');
+}
+
+.log-success::before {
+  background-color: token('color.background.success.indicator');
 }
 
 .confirm-spec {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Checkbox, Modal, Spinner, Tag, Text } from '@capra/core';
+import { Alert, Button, Checkbox, Modal, Spinner, Tag, Text, TextField } from '@capra/core';
 import { ReloadOutlined, SwapRightOutlined } from '@capra/icons';
 import {
   commitFiles,
@@ -45,12 +45,24 @@ const STATE_TAG: Record<SyncState, { color: 'success' | 'warning' | 'danger'; la
   error: { color: 'danger', label: 'not syncable' },
 };
 
+const fmtBytes = (n: number) =>
+  n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+
+const lookupMeta = (l: Lookup) =>
+  [
+    l.size !== undefined ? fmtBytes(l.size) : null,
+    l.rows !== undefined ? `${l.rows} row${l.rows === 1 ? '' : 's'}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
 function App() {
   const [groups, setGroups] = useState<Group[] | null>(null);
   const [sourceGroup, setSourceGroup] = useState(DEFAULT_SOURCE);
   const [lookups, setLookups] = useState<Lookup[] | null>(null);
   const [selectedLookups, setSelectedLookups] = useState<Set<string>>(new Set());
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
+  const [lookupFilter, setLookupFilter] = useState('');
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [compare, setCompare] = useState<CompareResult | null>(null);
@@ -304,7 +316,12 @@ function App() {
       <div className="selection-grid">
         <section className="panel">
           <div className="panel-header">
-            <Text variant="body-md-semibold">Source lookups</Text>
+            <span className="panel-title">
+              <Text variant="body-md-semibold">Source lookups</Text>
+              {selectedLookups.size > 0 && (
+                <Tag size="sm" color="accent">{`${selectedLookups.size} selected`}</Tag>
+              )}
+            </span>
             <div className="source-picker">
               <Text color="secondary">from</Text>
               <select
@@ -313,6 +330,7 @@ function App() {
                 onChange={(e) => {
                   setSourceGroup(e.target.value);
                   setSelectedLookups(new Set());
+                  setLookupFilter('');
                 }}
                 disabled={comparing || syncing}
               >
@@ -324,64 +342,111 @@ function App() {
               </select>
             </div>
           </div>
+          {lookups !== null && lookups.length > 6 && (
+            <TextField
+              aria-label="Filter lookups"
+              placeholder="Filter lookups…"
+              value={lookupFilter}
+              onChange={setLookupFilter}
+            />
+          )}
           {lookups === null ? (
             <div className="panel-loading"><Spinner /></div>
           ) : lookups.length === 0 ? (
             <Text color="secondary">No lookups in {sourceGroup}.</Text>
           ) : (
             <ul className="pick-list">
-              {lookups.map((l) => (
-                <li key={l.id}>
-                  <Checkbox
-                    checked={selectedLookups.has(l.id)}
-                    onChange={() => toggle(selectedLookups, l.id, setSelectedLookups)}
-                    disabled={comparing || syncing}
-                  >
-                    <span className="pick-label">
-                      <Text variant="code">{l.id}</Text>
-                      <Text color="tertiary" variant="body-xs-normal">
-                        {l.size !== undefined ? `${l.size} B` : ''}
-                        {l.rows !== undefined ? ` · ${l.rows} rows` : ''}
-                      </Text>
-                      {hasDottedStem(l.id) && (
-                        <Tag size="sm" color="amber">dotted name — won't sync</Tag>
-                      )}
-                    </span>
-                  </Checkbox>
-                </li>
-              ))}
+              {lookups
+                .filter((l) => l.id.toLowerCase().includes(lookupFilter.trim().toLowerCase()))
+                .map((l) => {
+                  const selected = selectedLookups.has(l.id);
+                  const busy = comparing || syncing;
+                  return (
+                    <li key={l.id}>
+                      <div
+                        className={`pick-row${selected ? ' selected' : ''}`}
+                        onClick={() => !busy && toggle(selectedLookups, l.id, setSelectedLookups)}
+                      >
+                        <span className="pick-check">
+                          <Checkbox
+                            checked={selected}
+                            onChange={() => toggle(selectedLookups, l.id, setSelectedLookups)}
+                            disabled={busy}
+                          />
+                        </span>
+                        <span className="row-name" title={l.id}>
+                          <Text variant="code">{l.id}</Text>
+                        </span>
+                        {hasDottedStem(l.id) && (
+                          <span
+                            className="row-tag"
+                            title="Worker groups treat the dotted name as pack notation — rename the export in Search to sync it"
+                          >
+                            <Tag size="sm" color="amber">won't sync</Tag>
+                          </span>
+                        )}
+                        <span className="row-meta">
+                          <Text color="tertiary" variant="body-xs-normal">{lookupMeta(l)}</Text>
+                        </span>
+                      </div>
+                    </li>
+                  );
+                })}
+              {lookupFilter.trim() !== '' &&
+                lookups.every((l) => !l.id.toLowerCase().includes(lookupFilter.trim().toLowerCase())) && (
+                  <li className="list-empty">
+                    <Text color="secondary">No lookups match “{lookupFilter.trim()}”.</Text>
+                  </li>
+                )}
             </ul>
           )}
         </section>
 
         <div className="arrow-cell">
-          <SwapRightOutlined size="lg" />
+          <SwapRightOutlined />
         </div>
 
         <section className="panel">
           <div className="panel-header">
-            <Text variant="body-md-semibold">Target groups</Text>
+            <span className="panel-title">
+              <Text variant="body-md-semibold">Target groups</Text>
+              {selectedGroups.size > 0 && (
+                <Tag size="sm" color="accent">{`${selectedGroups.size} selected`}</Tag>
+              )}
+            </span>
           </div>
           {groups === null ? (
             <div className="panel-loading"><Spinner /></div>
           ) : (
             <ul className="pick-list">
-              {targetGroups.map((g) => (
-                <li key={g.id}>
-                  <Checkbox
-                    checked={selectedGroups.has(g.id)}
-                    onChange={() => toggle(selectedGroups, g.id, setSelectedGroups)}
-                    disabled={comparing || syncing}
-                  >
-                    <span className="pick-label">
-                      <Text>{g.id}</Text>
-                      <Tag size="sm" color={g.isFleet ? 'iris' : 'criblTeal'}>
-                        {g.isFleet ? 'Edge fleet' : 'worker group'}
-                      </Tag>
-                    </span>
-                  </Checkbox>
-                </li>
-              ))}
+              {targetGroups.map((g) => {
+                const selected = selectedGroups.has(g.id);
+                const busy = comparing || syncing;
+                return (
+                  <li key={g.id}>
+                    <div
+                      className={`pick-row${selected ? ' selected' : ''}`}
+                      onClick={() => !busy && toggle(selectedGroups, g.id, setSelectedGroups)}
+                    >
+                      <span className="pick-check">
+                        <Checkbox
+                          checked={selected}
+                          onChange={() => toggle(selectedGroups, g.id, setSelectedGroups)}
+                          disabled={busy}
+                        />
+                      </span>
+                      <span className="row-name" title={g.id}>
+                        <Text>{g.id}</Text>
+                      </span>
+                      <span className="row-meta">
+                        <Tag size="sm" color={g.isFleet ? 'iris' : 'criblTeal'}>
+                          {g.isFleet ? 'Edge fleet' : 'worker group'}
+                        </Tag>
+                      </span>
+                    </div>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>
@@ -399,6 +464,12 @@ function App() {
         {compare && plan && plan.perGroup.length === 0 && (
           <Tag color="success">Everything in sync — nothing to do</Tag>
         )}
+        {!compare && selectedLookups.size > 0 && selectedGroups.size > 0 && (
+          <Text color="secondary" variant="body-sm-normal">
+            {selectedLookups.size} lookup{selectedLookups.size === 1 ? '' : 's'} →{' '}
+            {selectedGroups.size} group{selectedGroups.size === 1 ? '' : 's'}
+          </Text>
+        )}
       </div>
 
       {compare && Object.keys(compare.groups).length > 0 && (
@@ -410,9 +481,9 @@ function App() {
             <table className="status-table">
               <thead>
                 <tr>
-                  <th><Text color="secondary" variant="body-xs-normal">lookup</Text></th>
+                  <th><span className="th-label">Lookup</span></th>
                   {Object.keys(compare.groups).map((gid) => (
-                    <th key={gid}><Text variant="body-sm-semibold">{gid}</Text></th>
+                    <th key={gid}><span className="th-label">{gid}</span></th>
                   ))}
                 </tr>
               </thead>
