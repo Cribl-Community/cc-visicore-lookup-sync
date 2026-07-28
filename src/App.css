@@ -20,7 +20,7 @@
 }
 
 .page-header p {
-  max-width: 72ch;
+  max-width: none;
 }
 
 .selection-grid {
