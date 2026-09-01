@@ -1,5 +1,17 @@
 {
   "name": "cc-visicore-lookup-sync",
+  "author": "Andrew Hendrix - CriblPacks@VisiCoreTech.com",
+  "tags": {
+    "product": [
+      "edge",
+      "search",
+      "stream"
+    ]
+  },
+  "cribl": {
+    "type": "app",
+    "createAppScriptVersion": "0.4.0"
+  },
   "private": true,
   "version": "1.0.1",
   "type": "module",
@@ -30,18 +42,6 @@
   },
   "displayName": "Lookup Sync",
   "description": "Sync lookup files from Cribl Search knowledge (e.g. KQL '| export to lookup' results from Cribl Lake) into Stream worker groups and Edge fleets. Compares content, uploads only what changed, commits scoped to just the touched lookup files, and deploys on demand — all with explicit confirmation.",
-  "author": "Andrew Hendrix - <CriblPacks@VisiCoreTech.com>",
   "license": "Apache-2.0",
-  "tags": {
-    "product": [
-      "edge",
-      "search",
-      "stream"
-    ]
-  },
-  "minLogStreamVersion": "4.18.0",
-  "cribl": {
-    "type": "app",
-    "createAppScriptVersion": "0.4.0"
-  }
+  "minLogStreamVersion": "4.18.0"
 }
